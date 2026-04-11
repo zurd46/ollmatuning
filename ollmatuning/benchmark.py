@@ -65,8 +65,15 @@ class BenchResult:
 
 def _http_post(path: str, payload: dict, timeout: int = 600) -> dict:
     # Handle SSL context based on URL scheme
-+++++++
-REPLACE
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}{path}", data=data, headers=_auth_headers(), method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, ssl.SSLError) as e:
+        raise RuntimeError(f"HTTP error: {e}") from e
 
 
 def _http_get(path: str, timeout: int = 10) -> dict:
