@@ -12,6 +12,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+import ssl  # Added SSL module for security
 from dataclasses import dataclass
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -63,21 +64,27 @@ class BenchResult:
 
 
 def _http_post(path: str, payload: dict, timeout: int = 600) -> dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{OLLAMA_HOST}{path}",
-        data=data,
-        headers=_auth_headers({"Content-Type": "application/json"}),
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    # Handle SSL context based on URL scheme
++++++++
+REPLACE
 
 
 def _http_get(path: str, timeout: int = 10) -> dict:
-    req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    # Handle SSL context based on URL scheme
+    if OLLAMA_HOST.startswith("https://"):
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
+        try:
+            with urllib.request.urlopen(req, context=context, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except ssl.SSLError as e:
+            raise RuntimeError(f"SSL verification failed: {e}") from e
+    else:
+        req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
 
 
 def ollama_is_up() -> bool:
