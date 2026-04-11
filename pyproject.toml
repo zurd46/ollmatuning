@@ -1,0 +1,16 @@
+[project]
+name = "ollmatuning"
+version = "0.1.0"
+description = "Detect GPU/system, find the best Ollama coding+tool model, benchmark, and set it."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+ollmatuning = "ollmatuning.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ollmatuning*"]
