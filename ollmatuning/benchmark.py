@@ -53,13 +53,16 @@ class BenchResult:
     total_seconds: float
     ok: bool
     error: str = ""
+    vram_mb: int = 0       # actual VRAM/memory used by the model
+    peak_vram_mb: int = 0  # peak VRAM/memory during inference
 
     def summary(self) -> str:
         if not self.ok:
             return f"{self.model}: FEHLER ({self.error})"
+        vram = f", {self.vram_mb} MB VRAM" if self.vram_mb else ""
         return (
             f"{self.model}: {self.tokens_per_sec:6.2f} tok/s "
-            f"({self.eval_count} tok in {self.eval_seconds:.2f}s)"
+            f"({self.eval_count} tok in {self.eval_seconds:.2f}s{vram})"
         )
 
 
@@ -144,6 +147,20 @@ def pull_model(model: str, verbose: bool = True) -> bool:
         return False
 
 
+def _get_model_vram(model: str) -> int:
+    """Query /api/ps to get actual VRAM usage for a loaded model (in MB)."""
+    try:
+        data = _http_get("/api/ps", timeout=5)
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            if name == model or name.startswith(model + ":"):
+                size_bytes = m.get("size_vram", 0) or m.get("size", 0)
+                return int(size_bytes / (1024 * 1024))
+    except Exception:
+        pass
+    return 0
+
+
 def benchmark_model(model: str, prompts: list[tuple[str, str]] | None = None) -> BenchResult:
     prompts = prompts or BENCH_PROMPTS
     total_tokens = 0
@@ -158,6 +175,9 @@ def benchmark_model(model: str, prompts: list[tuple[str, str]] | None = None) ->
             "options": {"num_predict": 8},
         }, timeout=600)
 
+        # Measure actual VRAM after model is loaded.
+        vram_mb = _get_model_vram(model)
+
         for _label, prompt in prompts:
             resp = _http_post("/api/generate", {
                 "model": model,
@@ -167,6 +187,9 @@ def benchmark_model(model: str, prompts: list[tuple[str, str]] | None = None) ->
             }, timeout=1200)
             total_tokens += int(resp.get("eval_count", 0))
             total_eval_ns += int(resp.get("eval_duration", 0))
+
+        # Measure peak VRAM after inference.
+        peak_vram_mb = _get_model_vram(model)
     except Exception as e:
         return BenchResult(
             model=model, tokens_per_sec=0.0, eval_count=0,
@@ -182,4 +205,6 @@ def benchmark_model(model: str, prompts: list[tuple[str, str]] | None = None) ->
         eval_seconds=eval_s,
         total_seconds=time.perf_counter() - t0,
         ok=True,
+        vram_mb=vram_mb,
+        peak_vram_mb=peak_vram_mb or vram_mb,
     )

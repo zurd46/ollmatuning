@@ -159,6 +159,8 @@ def show_results(results: list[BenchResult]) -> None:
     table.add_column("Rank", style="bold yellow", justify="right", width=5)
     table.add_column("Model", style="bold bright_cyan")
     table.add_column("tok/s", style="bold bright_white", justify="right")
+    table.add_column("VRAM", style="bright_magenta", justify="right")
+    table.add_column("Peak", style="magenta", justify="right")
     table.add_column("Tokens", style="white", justify="right")
     table.add_column("Eval time", style="white", justify="right")
     table.add_column("Bar", ratio=1)
@@ -171,6 +173,8 @@ def show_results(results: list[BenchResult]) -> None:
                 "[red]-[/red]",
                 "-",
                 "-",
+                "-",
+                "-",
                 f"[red]✗ {r.error[:50]}[/red]",
             )
             continue
@@ -178,10 +182,14 @@ def show_results(results: list[BenchResult]) -> None:
         bar = "█" * bar_len
         style = "bright_green" if i == 1 else "green"
         medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f" {i}")
+        vram_str = f"{r.vram_mb / 1024:.1f} GB" if r.vram_mb else "-"
+        peak_str = f"{r.peak_vram_mb / 1024:.1f} GB" if r.peak_vram_mb else "-"
         table.add_row(
             f"{medal}",
             r.model,
             f"[{style}]{r.tokens_per_sec:.2f}[/{style}]",
+            vram_str,
+            peak_str,
             f"{r.eval_count}",
             f"{r.eval_seconds:.2f}s",
             f"[{style}]{bar}[/{style}]",
@@ -192,7 +200,7 @@ def show_results(results: list[BenchResult]) -> None:
 
 
 def show_winner(result: BenchResult) -> None:
-    body = Text.assemble(
+    parts = [
         ("🏆  ", "bold yellow"),
         (result.model, "bold bright_cyan"),
         ("\n\n", ""),
@@ -204,7 +212,20 @@ def show_winner(result: BenchResult) -> None:
         ("\n", ""),
         ("Eval time: ", "bold white"),
         (f"{result.eval_seconds:.2f}s", "white"),
-    )
+    ]
+    if result.vram_mb:
+        parts.extend([
+            ("\n", ""),
+            ("VRAM:      ", "bold white"),
+            (f"{result.vram_mb / 1024:.1f} GB", "bright_magenta"),
+        ])
+    if result.peak_vram_mb and result.peak_vram_mb != result.vram_mb:
+        parts.extend([
+            (" (peak ", "dim"),
+            (f"{result.peak_vram_mb / 1024:.1f} GB", "bright_magenta"),
+            (")", "dim"),
+        ])
+    body = Text.assemble(*parts)
     panel = Panel(
         Align.center(body),
         title="[bold bright_yellow]★ WINNER ★[/bold bright_yellow]",

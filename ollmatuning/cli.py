@@ -135,40 +135,63 @@ def _sort_candidates(cands: list[Candidate]) -> list[Candidate]:
 def _run_benchmark_pipeline(
     candidates: list[Candidate],
 ) -> list[BenchResult]:
-    """Benchmark a list of candidates, dispatching MLX vs Ollama per model."""
+    """Benchmark a list of candidates, dispatching MLX vs Ollama per model.
+
+    KeyboardInterrupt during a single model skips to the next one.
+    For MLX downloads, Ctrl+C during download saves progress — rerun resumes.
+    """
+    from .mlx_benchmark import is_model_cached
+
     local = set(list_local_models()) if ollama_is_up() else set()
     results: list[BenchResult] = []
+    skipped_count = 0
 
     with ui.make_progress() as progress:
         task = progress.add_task("Benchmark pipeline", total=len(candidates))
         for c in candidates:
             model = c.model
 
-            if c.runtime == "mlx":
-                progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] → MLX")
-                r = benchmark_mlx_model(model)
-            else:
-                # GGUF / Ollama path
-                progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] → check")
-                already_local = model in local or any(
-                    x == model or x.startswith(model + ":") for x in local
-                )
-                if not already_local:
-                    progress.update(task, description=f"[yellow]{model}[/yellow] → pull")
-                    if not pull_model(model, verbose=False):
-                        ui.error(f"Pull failed: {model}")
-                        results.append(BenchResult(model, 0, 0, 0, 0, False, "pull failed"))
-                        progress.advance(task)
-                        continue
-                progress.update(task, description=f"[bright_magenta]{model}[/bright_magenta] → benchmark")
-                r = benchmark_model(model)
+            try:
+                if c.runtime == "mlx":
+                    cached = is_model_cached(model)
+                    if cached:
+                        progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] → cached, benchmarking")
+                    else:
+                        progress.update(task, description=f"[yellow]{model}[/yellow] → downloading (Ctrl+C to skip)")
+                    r = benchmark_mlx_model(model)
+                else:
+                    # GGUF / Ollama path
+                    progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] → check")
+                    already_local = model in local or any(
+                        x == model or x.startswith(model + ":") for x in local
+                    )
+                    if not already_local:
+                        progress.update(task, description=f"[yellow]{model}[/yellow] → pull (Ctrl+C to skip)")
+                        if not pull_model(model, verbose=False):
+                            ui.error(f"Pull failed: {model}")
+                            results.append(BenchResult(model, 0, 0, 0, 0, False, "pull failed"))
+                            progress.advance(task)
+                            continue
+                    progress.update(task, description=f"[bright_magenta]{model}[/bright_magenta] → benchmark")
+                    r = benchmark_model(model)
 
-            if r.ok:
-                ui.success(f"{model}: [bold bright_green]{r.tokens_per_sec:.2f} tok/s[/bold bright_green]")
-            else:
-                ui.error(f"{model}: {r.error[:80]}")
-            results.append(r)
+                if r.ok:
+                    vram_info = f" | {r.vram_mb / 1024:.1f} GB VRAM" if r.vram_mb else ""
+                    ui.success(f"{model}: [bold bright_green]{r.tokens_per_sec:.2f} tok/s[/bold bright_green]{vram_info}")
+                else:
+                    ui.error(f"{model}: {r.error[:80]}")
+                results.append(r)
+
+            except KeyboardInterrupt:
+                skipped_count += 1
+                ui.warn(f"Skipped {model} (Ctrl+C). Download progress saved — rerun to resume.")
+                results.append(BenchResult(model, 0, 0, 0, 0, False, "skipped by user"))
+
             progress.advance(task)
+
+    if skipped_count:
+        ui.info(f"{skipped_count} model(s) skipped. Run again to resume downloads.")
+
     return results
 
 
@@ -278,6 +301,8 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
             "best_model": best.model,
             "tokens_per_sec": best.tokens_per_sec,
             "runtime": runtime,
+            "vram_mb": best.vram_mb,
+            "peak_vram_mb": best.peak_vram_mb,
         })
         ui.success(f"Saved to [bold]{CONFIG_PATH}[/bold]")
         _print_env_hint(best.model, runtime)
@@ -342,6 +367,8 @@ def cmd_auto(args: argparse.Namespace) -> int:
             "best_model": best.model,
             "tokens_per_sec": best.tokens_per_sec,
             "runtime": runtime,
+            "vram_mb": best.vram_mb,
+            "peak_vram_mb": best.peak_vram_mb,
         })
         ui.success(f"Saved to [bold]{CONFIG_PATH}[/bold]")
         _print_env_hint(best.model, runtime)
