@@ -225,7 +225,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     # Pre-flight checks
     if runtime == "mlx" and not mlx_lm_available():
         ui.error("mlx-lm is not installed.")
-        ui.info("Install it with:  [bold bright_cyan]pip install ollmatuning[mlx][/bold bright_cyan]")
+        ui.info("Install it with:  [bold bright_cyan]pip install 'ollmatuning\[mlx]'[/bold bright_cyan]")
         return 2
 
     if runtime == "ollama" and not ollama_is_up():
@@ -300,7 +300,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
     if runtime == "mlx":
         if not mlx_lm_available():
             ui.error("mlx-lm is not installed (required for MLX on Apple Silicon).")
-            ui.info("Install with:  [bold bright_cyan]pip install ollmatuning[mlx][/bold bright_cyan]")
+            ui.info("Install with:  [bold bright_cyan]pip install 'ollmatuning\[mlx]'[/bold bright_cyan]")
             return 2
     else:
         if not ollama_is_up():
