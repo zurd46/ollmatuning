@@ -1,97 +1,155 @@
 # ollmatuning
 
-**Finde automatisch das beste Ollama-LLM für Coding und Tool-Use auf deiner Hardware — mit echten Tokens/Sekunde-Messungen.**
+**Finde automatisch das beste quantisierte LLM für deine Hardware — mit echten Tokens/Sekunde- und VRAM-Messungen.**
 
-`ollmatuning` erkennt deine GPU und Treiber, recherchiert live auf [ollama.com](https://ollama.com), filtert Modelle nach verfügbarem VRAM, pullt die besten Kandidaten, benchmarkt sie mit repräsentativen Code- und Tool-Use-Prompts, und speichert den Sieger.
+`ollmatuning` erkennt dein System, sucht auf [HuggingFace](https://huggingface.co) nach optimalen quantisierten Modellen, benchmarkt sie und setzt den Sieger. Auf Apple Silicon läuft alles nativ über **MLX** — kein Ollama nötig. Auf Linux/Windows werden **GGUF**-Modelle via Ollama genutzt.
 
-## Features
+## Highlights
 
-- **Hardware-Erkennung** — NVIDIA (`nvidia-smi`), AMD, Intel, Apple Silicon (Windows / Linux / macOS)
+- **OS-aware Runtime** — Apple Silicon → MLX (nativ, schnellste), alles andere → GGUF via Ollama
+- **HuggingFace-Suche** — findet quantisierte Modelle (4-bit, 8-bit) direkt auf HuggingFace
+- **Smart Dedup** — wählt pro Modellfamilie die beste Quantisierung (bevorzugt 4-bit)
+- **Echte VRAM-Messung** — misst tatsächlichen Speicherverbrauch (Metal API / Ollama `/api/ps`)
+- **Resumable Downloads** — unterbrochene Downloads setzen automatisch fort
+- **Hardware-Erkennung** — NVIDIA, AMD, Intel, Apple Silicon (Windows / Linux / macOS)
 - **Treiber-Check** — warnt bei veralteten NVIDIA-Treibern (<525 für CUDA 12)
-- **Live-Recherche** — scraped `ollama.com/search?c=code` und `?c=tools` für aktuelle Modell-Familien
-- **VRAM-Fit** — schätzt Q4-Speicherbedarf (~0.6 GB/B Params + 1 GB Overhead) und filtert Modelle, die nicht passen
-- **Echte Benchmarks** — misst `tokens/sec` aus der Ollama HTTP-API (`eval_count / eval_duration`)
-- **Code + Tool-Use Prompts** — repräsentativ: Merge-Intervals-Funktion + JSON-Tool-Call-Prompt
-- **Ein-Befehl-Workflow** — `ollmatuning auto` macht alles, oder jeder Schritt einzeln
 - **Cooles Rich-UI** — Banner, farbige Tabellen, Progress-Bar, Medaillen-Ranking
+
+## Wie funktioniert die Runtime-Erkennung?
+
+| OS | Hardware | Runtime | Format | Ollama nötig? |
+|---|---|---|---|---|
+| macOS | Apple Silicon (M1–M5) | `mlx-lm` | MLX (safetensors) | Nein |
+| macOS | Intel | Ollama | GGUF | Ja |
+| Linux | NVIDIA / AMD | Ollama | GGUF | Ja |
+| Windows | NVIDIA | Ollama | GGUF | Ja |
 
 ## Voraussetzungen
 
 - Python **3.10+**
-- [Ollama](https://ollama.com/download) installiert und als Server erreichbar (`ollama serve` auf `127.0.0.1:11434`)
-- `rich` (wird mit `pip install .` installiert)
-- Optional: NVIDIA-Treiber + CUDA für GPU-Beschleunigung
+- **Apple Silicon (MLX):** `pip install 'ollmatuning[mlx]'`
+- **Alle anderen:** [Ollama](https://ollama.com/download) installiert und gestartet (`ollama serve`)
 
 ## Installation
 
 ```bash
 git clone <repo> ollmatuning
 cd ollmatuning
+
+# Standard (GGUF via Ollama)
 pip install .
+
+# Apple Silicon (MLX — empfohlen auf M1/M2/M3/M4/M5)
+pip install '.[mlx]'
 ```
 
-Oder direkt aus dem Quellverzeichnis ohne Installation:
+## Schnellstart
 
 ```bash
-python -m ollmatuning.cli <befehl>
+ollmatuning
 ```
 
-## Schnellstart — ein Befehl macht alles
+Das war's. `ollmatuning` erkennt automatisch dein System und wählt die richtige Runtime:
+
+1. **Detect** — Hardware, Treiber, Runtime erkennen
+2. **Search** — Quantisierte Modelle auf HuggingFace suchen
+3. **Benchmark** — Download + `tokens/sec` + VRAM messen
+4. **Set** — Sieger in `~/.ollmatuning/config.json` speichern
+
+### Auf Apple Silicon (MLX)
 
 ```bash
-ollama serve           # Terminal 1
-ollmatuning            # Terminal 2  (= ollmatuning auto)
+pip install '.[mlx]'
+ollmatuning          # sucht MLX-Modelle, benchmarkt nativ
 ```
 
-Das war's. `ollmatuning` läuft standardmäßig im `auto`-Modus und führt alle vier Schritte durch:
+Kein `ollama serve` nötig — Modelle laufen direkt über Apple's MLX Framework.
 
-1. **Detect** — Hardware und Treiber
-2. **Recommend** — Live-Recherche auf ollama.com und VRAM-Filter
-3. **Benchmark** — Pull + `tokens/sec` messen
-4. **Set** — Sieger in `~/.ollmatuning/config.json` speichern und `OLLAMA_MODEL`-Hinweis ausgeben
+### Auf Linux / Windows (GGUF + Ollama)
 
-## Einzelne Befehle
+```bash
+pip install .
+ollama serve         # Terminal 1
+ollmatuning          # Terminal 2
+```
 
-Jeder Schritt ist auch einzeln aufrufbar:
+## Befehle
 
 | Befehl | Zweck |
 |---|---|
-| `ollmatuning auto` | Alles in einem Rutsch (Default) |
-| `ollmatuning detect` | Nur Hardware + Treiber anzeigen |
+| `ollmatuning` / `ollmatuning auto` | Alles in einem Rutsch (Default) |
+| `ollmatuning detect` | Hardware, Treiber, empfohlene Runtime |
 | `ollmatuning detect --json` | Maschinenlesbare Ausgabe |
-| `ollmatuning recommend` | Kandidaten anzeigen, nichts pullen |
-| `ollmatuning benchmark` | Kandidaten pullen + messen |
+| `ollmatuning recommend` | Kandidaten anzeigen, nichts downloaden |
+| `ollmatuning benchmark` | Kandidaten downloaden + messen |
 | `ollmatuning benchmark --set-best` | Zusätzlich Sieger speichern |
-| `ollmatuning benchmark --models qwen2.5-coder:14b llama3.1:8b` | Explizite Modelle testen |
+| `ollmatuning benchmark --models <model1> <model2>` | Explizite Modelle testen |
 | `ollmatuning show` | Gespeicherten Sieger anzeigen |
 
-### Nützliche Flags
+### Flags
 
-- `--limit N` — wie viele Kandidaten getestet werden (Default: 3)
-- `--no-save` — (`auto`) Sieger nicht persistieren
-- `-v, --verbose` — URLs und Details während der Recherche zeigen
-- `-V, --version` — Version anzeigen
+| Flag | Beschreibung |
+|---|---|
+| `--limit N` | Anzahl Kandidaten begrenzen (Default: 6, `0` = alle) |
+| `--mlx` | MLX erzwingen (nur Apple Silicon) |
+| `--gguf` | GGUF via Ollama erzwingen (alle Plattformen) |
+| `--ollama` | Zusätzlich ollama.com Library durchsuchen |
+| `--no-save` | Sieger nicht speichern (`auto`) |
+| `--set-best` | Sieger speichern (`benchmark`) |
+| `-v, --verbose` | URLs und Details zeigen |
+| `-V, --version` | Version anzeigen |
 
-## Wie die Recherche funktioniert
+## Wie die Modell-Suche funktioniert
 
-1. **Kategorie-Seiten scrapen:** `https://ollama.com/search?c=code` und `?c=tools`
-2. **Familien extrahieren:** Alle `/library/<slug>` Links dedupen
-3. **Tag-Seiten laden:** `https://ollama.com/library/<slug>` — Parameter-Größen `7b`, `14b`, `32b` etc. extrahieren
-4. **VRAM filtern:** `est_vram_mb = 0.6 * size_b * 1024 + 1024` → muss ≤ GPU-VRAM sein (Fallback: 60 % System-RAM bei reinen CPU-Systemen)
-5. **Diversifizieren:** Pro Familie nur ein Tag (größter, der passt), damit nicht 5 Größen desselben Modells gebencht werden
+### HuggingFace (Standard)
 
-Wenn das Scraping fehlschlägt (kein Internet, Struktur geändert), wird eine kuratierte Fallback-Liste verwendet: `qwen2.5-coder`, `deepseek-coder-v2`, `qwen2.5`, `llama3.1`, `llama3.2`, `mistral-nemo`, `codellama`, `granite-code`, `codegemma`.
+1. **API-Suche** — `huggingface.co/api/models?filter=mlx` (Apple Silicon) oder `?filter=gguf` (alle anderen)
+2. **Mehrere Queries** — sucht nach "coder", "instruct", "tool calling" Modellen
+3. **File-Analyse** — liest `.safetensors` / `.gguf` Dateigrößen für VRAM-Schätzung
+4. **Smart Dedup** — pro Basis-Modell nur die beste Quantisierung (4-bit bevorzugt)
+5. **VRAM-Filter** — Apple Silicon: 75% Unified Memory Budget, GPU: erkannter VRAM
+
+### Ollama Library (optional mit `--ollama`)
+
+1. Scrapt `ollama.com/library` für alle Modellfamilien
+2. Prüft Capability-Badges (`tools`, `code`)
+3. Filtert Tags nach VRAM-Budget
+4. HEAD-verifiziert jeden Kandidaten
 
 ## Wie der Benchmark funktioniert
 
 Für jedes Modell:
 
-1. **Warm-up** — `num_predict=8`, um Gewichte in den RAM/VRAM zu laden
-2. **Code-Prompt** — "schreibe `merge_intervals` + 3 asserts"
-3. **Tool-Use-Prompt** — "erzeuge JSON-Calls für `get_weather(berlin)` und `get_weather(tokyo)`"
-4. **Metrik** — Summe `eval_count / eval_duration` aus der Ollama HTTP-API → **tokens/sec**
+1. **Download/Pull** — MLX: `huggingface_hub` (resumable), Ollama: `/api/pull` (resumable)
+2. **VRAM messen** — MLX: `mlx.core.metal.get_active_memory()`, Ollama: `/api/ps`
+3. **Warm-up** — kurze Generation um Gewichte in den Speicher zu laden
+4. **Code-Prompt** — "schreibe `merge_intervals` + 3 asserts"
+5. **Tool-Use-Prompt** — "erzeuge JSON-Calls für `get_weather(berlin)` und `get_weather(tokyo)`"
+6. **Peak-VRAM** — misst Speicher-Peak nach Inferenz
+7. **Metrik** — `tokens/sec` + tatsächlicher VRAM-Verbrauch
 
-Das Ranking ist deterministisch: höchste tok/s gewinnt. Der Sieger wird mit einem 🥇-Medaille-Panel hervorgehoben.
+### Beispiel-Output
+
+```
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃                    Benchmark Results                        ┃
+┣━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━┫
+┃Rank ┃ Model                  ┃ tok/s ┃  VRAM  ┃   Peak    ┃
+┣━━━━━╋━━━━━━━━━━━━━━━━━━━━━━━━╋━━━━━━━╋━━━━━━━━╋━━━━━━━━━━━┫
+┃ 🥇  ┃ Qwen2.5-Coder-14B-4bit┃ 58.42 ┃ 8.0 GB ┃  8.4 GB   ┃
+┃ 🥈  ┃ Qwen3-Coder-30B-4bit  ┃ 42.50 ┃ 16.3 GB┃ 16.8 GB   ┃
+┃ 🥉  ┃ Qwen2.5-Coder-32B-4bit┃ 38.10 ┃ 17.5 GB┃ 18.1 GB   ┃
+┗━━━━━┻━━━━━━━━━━━━━━━━━━━━━━━━┻━━━━━━━┻━━━━━━━━┻━━━━━━━━━━━┛
+```
+
+## Unterbrochene Downloads
+
+Downloads sind **immer resumable**:
+
+- **Ctrl+C während Download** — überspringt das aktuelle Modell, macht mit dem nächsten weiter
+- **Erneut starten** — setzt unterbrochene Downloads automatisch dort fort wo aufgehört wurde
+- **HuggingFace** — `.incomplete`-Dateien in `~/.cache/huggingface/`
+- **Ollama** — native Resume-Unterstützung in `/api/pull`
 
 ## Dateistruktur
 
@@ -101,11 +159,14 @@ ollmatuning/
 ├── README.md
 └── ollmatuning/
     ├── __init__.py
-    ├── cli.py          # argparse + Subcommands
-    ├── system.py       # Hardware/Treiber-Erkennung
-    ├── recommend.py    # ollama.com Scrape + VRAM-Filter
-    ├── benchmark.py    # Ollama HTTP API + tok/s
-    └── ui.py           # Rich Banner/Tables/Progress
+    ├── cli.py              # argparse, Subcommands, OS-aware Dispatch
+    ├── system.py           # Hardware/Treiber-Erkennung, Apple Silicon Detection
+    ├── recommend.py        # ollama.com Scrape + VRAM-Filter (optional)
+    ├── huggingface.py      # HuggingFace API: GGUF-Modell-Suche
+    ├── mlx_models.py       # HuggingFace API: MLX-Modell-Suche + Dedup
+    ├── benchmark.py        # Ollama HTTP API Benchmark + VRAM-Messung
+    ├── mlx_benchmark.py    # MLX Benchmark + Metal Memory + Resume
+    └── ui.py               # Rich Banner/Tables/Progress
 ```
 
 ## Konfiguration
@@ -116,40 +177,41 @@ ollmatuning/
 ~/.ollmatuning/config.json
 ```
 
-Beispiel:
+Beispiel (Apple Silicon / MLX):
 
 ```json
 {
-  "best_model": "qwen2.5-coder:14b",
-  "tokens_per_sec": 58.42
+  "best_model": "lmstudio-community/Qwen2.5-Coder-14B-Instruct-MLX-4bit",
+  "tokens_per_sec": 58.42,
+  "runtime": "mlx",
+  "vram_mb": 8192,
+  "peak_vram_mb": 8600
 }
 ```
 
-Zum Setzen für andere Tools:
+Beispiel (GGUF / Ollama):
 
-```bash
-# bash/zsh
-export OLLAMA_MODEL="qwen2.5-coder:14b"
-```
-
-```powershell
-# PowerShell
-$env:OLLAMA_MODEL = "qwen2.5-coder:14b"
-```
-
-```cmd
-:: cmd.exe
-set OLLAMA_MODEL=qwen2.5-coder:14b
+```json
+{
+  "best_model": "hf.co/bartowski/Qwen2.5-Coder-14B-Instruct-GGUF:Q4_K_M",
+  "tokens_per_sec": 45.20,
+  "runtime": "ollama",
+  "vram_mb": 9500,
+  "peak_vram_mb": 9800
+}
 ```
 
 ## Troubleshooting
 
-- **`FEHLER: Ollama-Server läuft nicht`** — starte `ollama serve` in einem anderen Terminal
-- **`nvidia-smi` nicht gefunden** — installiere den aktuellen NVIDIA-Treiber; ohne ihn fällt `ollmatuning` auf WMI/CIM (Windows), `lspci` (Linux) zurück
-- **OOM beim Benchmark** — mit `--limit 5` werden auch kleinere Modelle getestet; oder explizit per `--models qwen2.5-coder:7b`
-- **Scrape liefert nichts** — Fallback-Liste springt automatisch ein; prüfe Internet/Proxy
-- **Windows: kaputte Box-Zeichen** — Terminal ggf. auf Windows Terminal / UTF-8 umstellen (`chcp 65001`)
+| Problem | Lösung |
+|---|---|
+| `mlx-lm is not installed` | `pip install 'ollmatuning[mlx]'` |
+| `Ollama server is not running` | `ollama serve` in einem anderen Terminal starten |
+| `nvidia-smi` nicht gefunden | NVIDIA-Treiber installieren; Fallback auf WMI/lspci |
+| OOM beim Benchmark | `--limit 3` oder explizit `--models <kleines-modell>` |
+| Download zu langsam | Ctrl+C zum Skippen, erneut starten zum Fortsetzen |
+| Kaputte Box-Zeichen (Windows) | Windows Terminal + UTF-8 (`chcp 65001`) |
 
 ## Lizenz
 
-MIT — siehe Header in den Quelldateien.
+MIT
