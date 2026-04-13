@@ -1,10 +1,14 @@
-"""Find coding/tool-capable Ollama models that fit the detected hardware."""
+"""Find tool-capable Ollama models that fit the detected hardware.
+
+Hard rule: every candidate MUST support tool/function calling.
+Source of truth: ollama.com's `?c=tools` category listing.
+"""
 from __future__ import annotations
 
-import html
 import re
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from .system import SystemInfo
@@ -12,27 +16,19 @@ from .system import SystemInfo
 OLLAMA_LIBRARY = "https://ollama.com"
 USER_AGENT = "ollmatuning/0.1 (+https://github.com/)"
 
-# Curated fallback when the scrape fails — all known to be strong at code + tools.
-FALLBACK_MODELS = [
-    "qwen2.5-coder",
-    "deepseek-coder-v2",
-    "qwen2.5",
-    "llama3.1",
-    "llama3.2",
-    "mistral-nemo",
-    "codellama",
-    "granite-code",
-    "codegemma",
-]
+# Hard rule: NO hardcoded model names. Everything comes from live research
+# against ollama.com's search and library pages.
 
 
 @dataclass
 class Candidate:
-    model: str             # e.g. "qwen2.5-coder:7b"
-    family: str            # e.g. "qwen2.5-coder"
-    size_b: float          # parameter count in billions (best-effort)
-    est_vram_mb: int       # rough VRAM need at Q4
-    categories: list[str]  # ["code", "tools", ...]
+    model: str
+    family: str
+    size_b: float
+    est_vram_mb: int
+    categories: list[str]  # always contains "tools"; may also contain "code"
+    source: str = "ollama"   # "ollama" or "huggingface"
+    runtime: str = "ollama"  # "ollama" or "mlx"
 
     @property
     def pretty(self) -> str:
@@ -48,9 +44,28 @@ def _fetch(url: str, timeout: int = 15) -> str:
         return ""
 
 
+def _head_ok(url: str, timeout: int = 10) -> bool:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 405):
+            return bool(_fetch(url, timeout=timeout))
+        return False
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def verify_model_exists(model: str) -> bool:
+    """Check that <family>:<tag> resolves on ollama.com."""
+    if ":" not in model:
+        return False
+    family, tag = model.split(":", 1)
+    return _head_ok(f"{OLLAMA_LIBRARY}/library/{family}:{tag}")
+
+
 def _parse_library_page(page_html: str) -> list[str]:
-    """Extract model family slugs from an ollama.com/search or /library page."""
-    # Links look like: <a href="/library/qwen2.5-coder" ...>
     slugs = re.findall(r'href="/library/([a-z0-9][a-z0-9._\-]*)"', page_html)
     seen: list[str] = []
     for s in slugs:
@@ -59,10 +74,127 @@ def _parse_library_page(page_html: str) -> list[str]:
     return seen
 
 
+def _fetch_category(cat: str, verbose: bool = False) -> list[str]:
+    """Fetch a category page plus its paginated continuations."""
+    families: list[str] = []
+    # ollama.com uses ?c=<cat>&p=<page> — walk pages until empty.
+    for page_num in range(1, 11):  # 10 pages cap is plenty
+        url = (
+            f"{OLLAMA_LIBRARY}/search?c={cat}"
+            if page_num == 1
+            else f"{OLLAMA_LIBRARY}/search?c={cat}&p={page_num}"
+        )
+        if verbose:
+            print(f"  fetch {url}")
+        page = _fetch(url)
+        if not page:
+            break
+        found = _parse_library_page(page)
+        new = [f for f in found if f not in families]
+        if not new:
+            break
+        families.extend(new)
+    return families
+
+
+def _fetch_full_library(verbose: bool = False) -> list[str]:
+    """Scrape the main /library listing for additional families."""
+    families: list[str] = []
+    for page_num in range(1, 11):
+        url = (
+            f"{OLLAMA_LIBRARY}/library"
+            if page_num == 1
+            else f"{OLLAMA_LIBRARY}/library?p={page_num}"
+        )
+        if verbose:
+            print(f"  fetch {url}")
+        page = _fetch(url)
+        if not page:
+            break
+        found = _parse_library_page(page)
+        new = [f for f in found if f not in families]
+        if not new:
+            break
+        families.extend(new)
+    return families
+
+
+_CAPABILITY_RE = re.compile(
+    r">(tools|embedding|vision|thinking)(?:<|[\"'])", re.IGNORECASE
+)
+
+
+def model_capabilities(family: str) -> set[str]:
+    """Return the capability badges shown on https://ollama.com/library/<family>."""
+    page = _fetch(f"{OLLAMA_LIBRARY}/library/{family}")
+    if not page:
+        return set()
+    return {m.lower() for m in _CAPABILITY_RE.findall(page)}
+
+
+def model_has_tools(family: str) -> bool:
+    """True iff ollama.com's capability badges for this family include 'tools'."""
+    return "tools" in model_capabilities(family)
+
+
+def discover_models(
+    verbose: bool = False,
+    progress_cb=None,
+) -> tuple[list[str], set[str]]:
+    """Return (tool_families, code_family_set) — 100 % live from ollama.com.
+
+    Zero hardcoded model names. Strategy:
+      1. Fetch the full `/library` — ~200+ families, the authoritative list.
+      2. For every family, fetch its detail page in parallel and read the
+         capability badges. Keep only those that advertise 'tools'.
+      3. Also fetch `/search?c=code` to mark which tool-capable models are
+         also code-capable (used for ranking, not gating).
+
+    Hard rule: NOTHING without a verified 'tools' badge is returned.
+    """
+    library = _fetch_full_library(verbose=verbose)
+    if verbose:
+        print(f"  full library: {len(library)} families")
+    if not library:
+        return [], set()
+
+    code = _fetch_category("code", verbose=verbose)
+    code_set = set(code)
+    if verbose:
+        print(f"  code category: {len(code)} families")
+
+    # Parallel capability probe — the slow step, so we fan out.
+    tool_families: list[str] = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {pool.submit(model_capabilities, fam): fam for fam in library}
+        done = 0
+        for fut in as_completed(futures):
+            fam = futures[fut]
+            done += 1
+            if progress_cb:
+                progress_cb(done, len(futures), fam)
+            try:
+                caps = fut.result()
+            except Exception:
+                caps = set()
+            if "tools" in caps:
+                tool_families.append(fam)
+                if verbose:
+                    print(f"  tools ok: {fam}  {sorted(caps)}")
+
+    # Preserve library order (popularity-ranked by ollama.com).
+    order_index = {fam: i for i, fam in enumerate(library)}
+    tool_families.sort(key=lambda f: order_index.get(f, 1 << 30))
+
+    # Rank: code AND tools first, then tools only.
+    intersection = [f for f in tool_families if f in code_set]
+    rest = [f for f in tool_families if f not in code_set]
+    ordered = intersection + rest
+    return ordered, code_set
+
+
 def _parse_model_tags(model_page_html: str) -> list[tuple[str, float]]:
-    """Return [(tag, size_b)] for a model's detail page."""
     tags: list[tuple[str, float]] = []
-    # Tags appear as /library/<family>:<tag>
     raw_tags = re.findall(r"/library/[a-z0-9._\-]+:([a-z0-9._\-]+)", model_page_html)
     seen = set()
     for t in raw_tags:
@@ -83,88 +215,106 @@ def _tag_to_size_b(tag: str) -> float:
 
 
 def _estimate_vram_mb(size_b: float) -> int:
-    # Q4_K_M rule of thumb: ~0.6 GB per B params + ~1 GB overhead.
     return int(size_b * 600 + 1024)
 
 
-def discover_models(verbose: bool = False) -> list[str]:
-    """Scrape ollama.com for models tagged with code and/or tools support."""
-    found: list[str] = []
-    for cat in ("code", "tools"):
-        url = f"{OLLAMA_LIBRARY}/search?c={cat}"
-        if verbose:
-            print(f"  fetch {url}")
-        page = _fetch(url)
-        if page:
-            found.extend(_parse_library_page(page))
-    # Preserve order, dedupe.
-    ordered: list[str] = []
-    for f in found:
-        if f not in ordered:
-            ordered.append(f)
-    if not ordered:
-        if verbose:
-            print("  (scrape leer — nutze Fallback-Liste)")
-        ordered = list(FALLBACK_MODELS)
-    return ordered
+def _fetch_authoritative_tags(family: str, verbose: bool = False) -> list[tuple[str, float]]:
+    url = f"{OLLAMA_LIBRARY}/library/{family}/tags"
+    if verbose:
+        print(f"  fetch {url}")
+    page = _fetch(url)
+    if not page:
+        return []
+    tags = _parse_model_tags(page)
+    if not tags:
+        main = _fetch(f"{OLLAMA_LIBRARY}/library/{family}")
+        if main:
+            tags = _parse_model_tags(main)
+    return tags
 
 
 def expand_candidates(
     families: list[str],
     info: SystemInfo,
+    code_set: set[str] | None = None,
     verbose: bool = False,
 ) -> list[Candidate]:
-    """For each family, fetch its tags and keep those that fit in available VRAM/RAM."""
-    # Budget: prefer VRAM; fall back to 60% of system RAM when no discrete GPU VRAM is known.
+    """Expand each tool-capable family into size-filtered Candidate objects.
+
+    Safety: we NEVER invent tags — families with no parseable published tags are
+    dropped. Families are assumed tool-capable (the caller filters this), so every
+    returned Candidate carries the 'tools' category.
+    """
+    code_set = code_set or set()
+
     vram = info.usable_vram_mb
     if vram < 2048:
         vram = int(info.ram_mb * 0.6)
     if vram <= 0:
-        vram = 8192  # conservative default
+        vram = 8192
 
     candidates: list[Candidate] = []
     for fam in families:
-        url = f"{OLLAMA_LIBRARY}/library/{fam}"
-        if verbose:
-            print(f"  fetch {url}")
-        page = _fetch(url)
-        tags = _parse_model_tags(page) if page else []
+        tags = _fetch_authoritative_tags(fam, verbose=verbose)
         if not tags:
-            # Heuristic default tags when scrape fails.
-            tags = [("7b", 7.0), ("8b", 8.0), ("13b", 13.0), ("14b", 14.0), ("32b", 32.0)]
+            if verbose:
+                print(f"  skip {fam} — no published tags")
+            continue
+        cats = ["tools"]
+        if fam in code_set:
+            cats.insert(0, "code")
         for tag, size_b in tags:
             est = _estimate_vram_mb(size_b)
             if est > vram:
                 continue
-            cats = _guess_categories(fam)
             candidates.append(
                 Candidate(
                     model=f"{fam}:{tag}",
                     family=fam,
                     size_b=size_b,
                     est_vram_mb=est,
-                    categories=cats,
+                    categories=list(cats),
                 )
             )
-    # Sort: larger = generally smarter; keep biggest-that-fits first.
-    candidates.sort(key=lambda c: (-c.size_b, c.model))
+    # Sort: code+tools first, then bigger-first within that.
+    candidates.sort(key=lambda c: (0 if "code" in c.categories else 1, -c.size_b, c.model))
     return candidates
 
 
-def _guess_categories(family: str) -> list[str]:
-    f = family.lower()
-    cats: list[str] = []
-    if "coder" in f or "code" in f:
-        cats.append("code")
-    if any(k in f for k in ("qwen2.5", "llama3", "mistral", "nemo", "granite", "command-r", "hermes")):
-        cats.append("tools")
-    if not cats:
-        cats.append("general")
-    return cats
+def verify_candidates(
+    candidates: list[Candidate],
+    verbose: bool = False,
+) -> list[Candidate]:
+    """HEAD-check every candidate model:tag in parallel. Tool capability is
+    already enforced upstream in `discover_models`, so this only gates tag existence.
+    """
+    verified: list[Candidate] = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {pool.submit(verify_model_exists, c.model): c for c in candidates}
+        for fut in as_completed(futures):
+            c = futures[fut]
+            try:
+                ok = fut.result()
+            except Exception:
+                ok = False
+            if ok:
+                verified.append(c)
+                if verbose:
+                    print(f"  ok {c.model}")
+            elif verbose:
+                print(f"  x {c.model} (not on ollama.com)")
+    # Preserve the original ranking order.
+    order = {c.model: i for i, c in enumerate(candidates)}
+    verified.sort(key=lambda c: order[c.model])
+    return verified
 
 
-def shortlist(candidates: list[Candidate], limit: int = 3) -> list[Candidate]:
-    """Pick top-N distinct families so we benchmark a variety, not 5 sizes of one model."""
+def shortlist(candidates: list[Candidate], limit: int | None = None) -> list[Candidate]:
+    """Pick one distinct family per entry. If `limit` is None, return all families.
+
+    This keeps the benchmark set diverse (max one size per family) while still
+    covering every eligible family when the caller wants the full sweep.
+    """
     seen_families: set[str] = set()
     picked: list[Candidate] = []
     for c in candidates:
@@ -172,6 +322,6 @@ def shortlist(candidates: list[Candidate], limit: int = 3) -> list[Candidate]:
             continue
         seen_families.add(c.family)
         picked.append(c)
-        if len(picked) >= limit:
+        if limit is not None and len(picked) >= limit:
             break
     return picked

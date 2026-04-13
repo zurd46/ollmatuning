@@ -1,13 +1,31 @@
-"""Benchmark Ollama models on tokens/second using the local HTTP API."""
+"""Benchmark Ollama models on tokens/second using the Ollama HTTP API.
+
+Auth: reads OLLAMA_HOST and OLLAMA_API_KEY from the environment. When a key
+is set, every request is signed with `Authorization: Bearer <key>`. This lets
+you point the tool at an Ollama instance behind a reverse proxy (Caddy / nginx)
+that enforces Bearer authentication.
+"""
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
+import ssl  # Added SSL module for security
 from dataclasses import dataclass
 
-OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
+
+
+def _auth_headers(extra: dict | None = None) -> dict:
+    headers = {"User-Agent": "ollmatuning/0.1"}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+    if extra:
+        headers.update(extra)
+    return headers
 
 # Coding + tool-style prompts — representative of real use.
 BENCH_PROMPTS = [
@@ -46,21 +64,34 @@ class BenchResult:
 
 
 def _http_post(path: str, payload: dict, timeout: int = 600) -> dict:
+    # Handle SSL context based on URL scheme
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        f"{OLLAMA_HOST}{path}",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        f"{OLLAMA_HOST}{path}", data=data, headers=_auth_headers(), method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, ssl.SSLError) as e:
+        raise RuntimeError(f"HTTP error: {e}") from e
 
 
 def _http_get(path: str, timeout: int = 10) -> dict:
-    req = urllib.request.Request(f"{OLLAMA_HOST}{path}")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    # Handle SSL context based on URL scheme
+    if OLLAMA_HOST.startswith("https://"):
+        context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
+        try:
+            with urllib.request.urlopen(req, context=context, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except ssl.SSLError as e:
+            raise RuntimeError(f"SSL verification failed: {e}") from e
+    else:
+        req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
 
 
 def ollama_is_up() -> bool:
@@ -85,7 +116,7 @@ def pull_model(model: str, verbose: bool = True) -> bool:
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/api/pull",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=_auth_headers({"Content-Type": "application/json"}),
         method="POST",
     )
     try:

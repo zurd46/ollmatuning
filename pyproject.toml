@@ -3,7 +3,10 @@ name = "ollmatuning"
 version = "0.1.0"
 description = "Detect GPU/system, find the best Ollama coding+tool model, benchmark, and set it."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["rich>=13.0"]
+
+[project.optional-dependencies]
+mlx = ["mlx-lm>=0.18"]
 
 [project.scripts]
 ollmatuning = "ollmatuning.cli:main"

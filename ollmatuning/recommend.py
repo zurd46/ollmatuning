@@ -27,6 +27,8 @@ class Candidate:
     size_b: float
     est_vram_mb: int
     categories: list[str]  # always contains "tools"; may also contain "code"
+    source: str = "ollama"   # "ollama" or "huggingface"
+    runtime: str = "ollama"  # "ollama" or "mlx"
 
     @property
     def pretty(self) -> str:

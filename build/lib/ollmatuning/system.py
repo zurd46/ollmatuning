@@ -230,7 +230,7 @@ def check_driver(gpu: GPU) -> None:
     if gpu.vendor == "nvidia":
         if not gpu.driver_version:
             gpu.driver_ok = False
-            gpu.driver_note = "NVIDIA-Treiber nicht erkannt (nvidia-smi fehlt?)"
+            gpu.driver_note = "NVIDIA driver not detected (nvidia-smi missing?)"
             return
         try:
             major = int(gpu.driver_version.split(".")[0])
@@ -238,17 +238,22 @@ def check_driver(gpu: GPU) -> None:
             major = 0
         if major and major < 525:
             gpu.driver_ok = False
-            gpu.driver_note = f"Treiber {gpu.driver_version} ist alt — >=525 empfohlen für CUDA 12."
+            gpu.driver_note = f"Driver {gpu.driver_version} is old — >=525 recommended for CUDA 12."
         else:
-            gpu.driver_note = f"NVIDIA-Treiber {gpu.driver_version} OK."
+            gpu.driver_note = f"NVIDIA driver {gpu.driver_version} OK."
     elif gpu.vendor == "amd":
-        gpu.driver_note = "AMD erkannt — ROCm unter Linux empfohlen; Windows mit Ollama via Vulkan/DirectML begrenzt."
+        gpu.driver_note = "AMD detected — ROCm on Linux recommended; limited Ollama support on Windows (Vulkan/DirectML)."
     elif gpu.vendor == "intel":
-        gpu.driver_note = "Intel-GPU — Ollama nutzt CPU-Fallback, keine echte GPU-Beschleunigung."
+        gpu.driver_note = "Intel GPU — Ollama falls back to CPU, no real GPU acceleration."
     elif gpu.vendor == "apple":
-        gpu.driver_note = "Apple Silicon — Metal-Beschleunigung aktiv."
+        gpu.driver_note = "Apple Silicon — Metal acceleration active."
     else:
-        gpu.driver_note = "Unbekannter GPU-Typ."
+        gpu.driver_note = "Unknown GPU type."
+
+
+def is_apple_silicon() -> bool:
+    """True on macOS ARM64 (M1/M2/M3/M4)."""
+    return platform.system() == "Darwin" and platform.machine().lower() in ("arm64", "aarch64")
 
 
 def detect_system() -> SystemInfo:

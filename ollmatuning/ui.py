@@ -100,6 +100,7 @@ def show_candidates(candidates: list[Candidate], title: str = "Candidates") -> N
         expand=True,
     )
     table.add_column("#", style="bold yellow", justify="right", width=3)
+    table.add_column("Source", style="white", justify="center", width=6)
     table.add_column("Model", style="bold bright_cyan")
     table.add_column("Params", style="white", justify="right")
     table.add_column("~VRAM", style="green", justify="right")
@@ -107,8 +108,16 @@ def show_candidates(candidates: list[Candidate], title: str = "Candidates") -> N
 
     for i, c in enumerate(candidates, 1):
         cats = " ".join(f"[black on bright_blue] {x} [/black on bright_blue]" for x in c.categories)
+        rt = getattr(c, "runtime", "ollama")
+        if rt == "mlx":
+            src_label = "[black on bright_cyan] MLX [/black on bright_cyan]"
+        elif getattr(c, "source", "ollama") == "huggingface":
+            src_label = "[black on bright_yellow] GGUF [/black on bright_yellow]"
+        else:
+            src_label = "[black on bright_green] OL [/black on bright_green]"
         table.add_row(
             str(i),
+            src_label,
             c.model,
             f"{c.size_b:g}B",
             f"{c.est_vram_mb / 1024:.1f} GB",
@@ -118,13 +127,13 @@ def show_candidates(candidates: list[Candidate], title: str = "Candidates") -> N
     console.print()
 
 
-def show_families(families: list[str], n_shown: int = 12) -> None:
+def show_families(families: list[str], n_shown: int = 12, source: str = "ollama.com") -> None:
     head = ", ".join(families[:n_shown])
     more = f" [dim]+{len(families) - n_shown} more[/dim]" if len(families) > n_shown else ""
     console.print(
         Panel(
             f"[bright_white]{head}[/bright_white]{more}",
-            title=f"[bold]{len(families)} model families from ollama.com[/bold]",
+            title=f"[bold]{len(families)} model families from {source}[/bold]",
             border_style="cyan",
             box=ROUNDED,
         )

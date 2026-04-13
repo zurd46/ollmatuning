@@ -251,6 +251,11 @@ def check_driver(gpu: GPU) -> None:
         gpu.driver_note = "Unknown GPU type."
 
 
+def is_apple_silicon() -> bool:
+    """True on macOS ARM64 (M1/M2/M3/M4)."""
+    return platform.system() == "Darwin" and platform.machine().lower() in ("arm64", "aarch64")
+
+
 def detect_system() -> SystemInfo:
     system = platform.system()
     if system == "Windows":

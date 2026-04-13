@@ -3,3 +3,6 @@ Name: ollmatuning
 Version: 0.1.0
 Summary: Detect GPU/system, find the best Ollama coding+tool model, benchmark, and set it.
 Requires-Python: >=3.10
+Requires-Dist: rich>=13.0
+Provides-Extra: mlx
+Requires-Dist: mlx-lm>=0.18; extra == "mlx"
