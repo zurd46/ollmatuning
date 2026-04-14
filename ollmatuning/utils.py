@@ -210,16 +210,21 @@ def compute_vram_budget(
 ) -> int:
     """Compute the usable VRAM/memory budget for model selection.
 
+    - For MLX (unified memory), always apply RAM_FRACTION_MLX to leave
+      room for macOS and other apps.
     - If dedicated VRAM < VRAM_SMALL_THRESHOLD_MB, use a fraction of RAM.
     - Falls back to DEFAULT_VRAM_FALLBACK_MB if both are 0.
-    - For MLX, uses RAM_FRACTION_MLX; for GGUF/Ollama, RAM_FRACTION_GGUF.
     """
+    if runtime == "mlx":
+        total = vram_mb or ram_mb
+        if total > 0:
+            return int(total * RAM_FRACTION_MLX)
+        return DEFAULT_MLX_BUDGET_MB
     if vram_mb >= VRAM_SMALL_THRESHOLD_MB:
         return vram_mb
     if ram_mb > 0:
-        fraction = RAM_FRACTION_MLX if runtime == "mlx" else RAM_FRACTION_GGUF
-        return int(ram_mb * fraction)
-    return DEFAULT_VRAM_FALLBACK_MB if runtime != "mlx" else DEFAULT_MLX_BUDGET_MB
+        return int(ram_mb * RAM_FRACTION_GGUF)
+    return DEFAULT_VRAM_FALLBACK_MB
 
 
 def estimate_vram_gguf(file_size_bytes: int) -> int:
