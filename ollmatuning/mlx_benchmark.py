@@ -34,8 +34,8 @@ def _metal_memory_mb() -> tuple[int, int]:
     """Return (active_mb, peak_mb) from Metal GPU memory stats."""
     try:
         import mlx.core as mx
-        active = mx.metal.get_active_memory() // (1024 * 1024)
-        peak = mx.metal.get_peak_memory() // (1024 * 1024)
+        active = mx.get_active_memory() // (1024 * 1024)
+        peak = mx.get_peak_memory() // (1024 * 1024)
         return active, peak
     except Exception:
         logger.debug("Failed to read Metal memory stats", exc_info=True)
@@ -46,7 +46,7 @@ def _reset_peak_memory() -> None:
     """Reset the Metal peak memory counter."""
     try:
         import mlx.core as mx
-        mx.metal.reset_peak_memory()
+        mx.reset_peak_memory()
     except Exception:
         logger.debug("Failed to reset Metal peak memory", exc_info=True)
 
@@ -178,6 +178,7 @@ def benchmark_mlx_model(
 
     try:
         from mlx_lm import load, generate
+        from mlx_lm.utils import load_model
     except ImportError:
         return BenchResult(
             model=repo_id,
@@ -209,7 +210,13 @@ def benchmark_mlx_model(
     tokenizer = None
     try:
         _reset_peak_memory()
-        model, tokenizer = load(local_path)
+        try:
+            model, tokenizer = load(local_path)
+        except ValueError:
+            # Retry with strict=False for models with extra parameters (e.g. bias)
+            from mlx_lm.tokenizer_utils import load_tokenizer
+            model, _ = load_model(local_path, strict=False)
+            tokenizer = load_tokenizer(local_path)
         vram_mb, _ = _metal_memory_mb()
         _reset_peak_memory()
     except Exception as e:

@@ -28,7 +28,8 @@
       "Bash(.venv/bin/python3.13 -c ':*)",
       "Bash(.venv/bin/python -c \"import mlx.core as mx; print\\(dir\\(mx\\)\\)\")",
       "Bash(.venv/bin/python -c \"import mlx.core as mx; print\\(hasattr\\(mx, 'get_active_memory'\\), hasattr\\(mx, 'get_peak_memory'\\), hasattr\\(mx, 'reset_peak_memory'\\)\\)\")",
-      "Bash(.venv/bin/python -c \"from mlx_lm import load; import inspect; sig = inspect.signature\\(load\\); print\\(sig\\)\")"
+      "Bash(.venv/bin/python -c \"from mlx_lm import load; import inspect; sig = inspect.signature\\(load\\); print\\(sig\\)\")",
+      "Bash(.venv/bin/python -c \"from mlx_lm.tokenizer_utils import load_tokenizer; print\\('OK'\\)\")"
     ]
   }
 }
