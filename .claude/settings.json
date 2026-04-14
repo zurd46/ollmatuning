@@ -11,7 +11,24 @@
       "Bash(.venv/bin/ollmatuning)",
       "Read(//usr/local/**)",
       "Bash(ollama --version)",
-      "WebFetch(domain:docs.ollama.com)"
+      "WebFetch(domain:docs.ollama.com)",
+      "Bash(.venv/bin/python -c \"import ollmatuning; print\\(ollmatuning.__file__\\)\")",
+      "Bash(.venv/bin/python -c \"from ollmatuning.cli import main; print\\('OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import sys; print\\('\\\\n'.join\\(sys.path\\)\\)\")",
+      "Bash(echo \"---EXIT: $?\")",
+      "Read(//opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/bin/**)",
+      "Bash(ls -la .venv/bin/python*)",
+      "Bash(ls .venv/lib/python3.13/site-packages/ollmatuning*)",
+      "Bash(ls .venv/lib/python3.13/site-packages/__editable__*)",
+      "Bash(.venv/bin/ollmatuning --version)",
+      "Bash(.venv/bin/python -c \"from ollmatuning.cli import main; print\\('import OK'\\)\")",
+      "Bash(.venv/bin/python -c \"import ollmatuning; print\\(ollmatuning.__file__\\); from ollmatuning.cli import main; print\\('OK'\\)\")",
+      "Bash(.venv/bin/python3.13 -c \"import ollmatuning; print\\(ollmatuning.__file__\\)\")",
+      "Bash(.venv/bin/python3.13 .venv/bin/ollmatuning --version)",
+      "Bash(.venv/bin/python3.13 -c ':*)",
+      "Bash(.venv/bin/python -c \"import mlx.core as mx; print\\(dir\\(mx\\)\\)\")",
+      "Bash(.venv/bin/python -c \"import mlx.core as mx; print\\(hasattr\\(mx, 'get_active_memory'\\), hasattr\\(mx, 'get_peak_memory'\\), hasattr\\(mx, 'reset_peak_memory'\\)\\)\")",
+      "Bash(.venv/bin/python -c \"from mlx_lm import load; import inspect; sig = inspect.signature\\(load\\); print\\(sig\\)\")"
     ]
   }
 }
