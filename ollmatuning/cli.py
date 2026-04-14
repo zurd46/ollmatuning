@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from .benchmark import (
 from .huggingface import discover_hf_models, expand_hf_candidates
 from .mlx_models import discover_mlx_models, expand_mlx_candidates
 from .mlx_benchmark import mlx_lm_available, benchmark_mlx_model
+from .utils import setup_logging
 
 CONFIG_PATH = Path.home() / ".ollmatuning" / "config.json"
 
@@ -452,6 +454,7 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Parse args first to get verbose flag for logging setup.
     p = argparse.ArgumentParser(
         prog="ollmatuning",
         description=(
@@ -491,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(func=cmd_show)
 
     args = p.parse_args(argv)
+    setup_logging(verbose=getattr(args, "verbose", False))
     if not getattr(args, "command", None):
         args = p.parse_args(["auto", *(argv or [])])
     if getattr(args, "limit", None) == 0:

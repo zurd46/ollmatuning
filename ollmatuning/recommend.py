@@ -5,6 +5,7 @@ Source of truth: ollama.com's `?c=tools` category listing.
 """
 from __future__ import annotations
 
+import logging
 import re
 import urllib.error
 import urllib.request
@@ -12,9 +13,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from .system import SystemInfo
+from .utils import (
+    OLLAMA_LIBRARY_URL,
+    USER_AGENT,
+    HTTP_TIMEOUT_SHORT,
+    HTTP_TIMEOUT_MEDIUM,
+    OLLAMA_VERIFY_WORKERS,
+    fetch_text,
+    compute_vram_budget,
+    estimate_vram_ollama,
+)
 
-OLLAMA_LIBRARY = "https://ollama.com"
-USER_AGENT = "ollmatuning/0.1 (+https://github.com/)"
+logger = logging.getLogger(__name__)
 
 # Hard rule: NO hardcoded model names. Everything comes from live research
 # against ollama.com's search and library pages.
@@ -35,23 +45,14 @@ class Candidate:
         return f"{self.model} (~{self.size_b:g}B, ~{self.est_vram_mb} MB VRAM)"
 
 
-def _fetch(url: str, timeout: int = 15) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return ""
-
-
-def _head_ok(url: str, timeout: int = 10) -> bool:
+def _head_ok(url: str, timeout: int = HTTP_TIMEOUT_SHORT) -> bool:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT}, method="HEAD")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return 200 <= r.status < 300
     except urllib.error.HTTPError as e:
         if e.code in (403, 405):
-            return bool(_fetch(url, timeout=timeout))
+            return bool(fetch_text(url, timeout=timeout))
         return False
     except (urllib.error.URLError, TimeoutError, OSError):
         return False
@@ -62,7 +63,7 @@ def verify_model_exists(model: str) -> bool:
     if ":" not in model:
         return False
     family, tag = model.split(":", 1)
-    return _head_ok(f"{OLLAMA_LIBRARY}/library/{family}:{tag}")
+    return _head_ok(f"{OLLAMA_LIBRARY_URL}/library/{family}:{tag}")
 
 
 def _parse_library_page(page_html: str) -> list[str]:
@@ -80,13 +81,13 @@ def _fetch_category(cat: str, verbose: bool = False) -> list[str]:
     # ollama.com uses ?c=<cat>&p=<page> — walk pages until empty.
     for page_num in range(1, 11):  # 10 pages cap is plenty
         url = (
-            f"{OLLAMA_LIBRARY}/search?c={cat}"
+            f"{OLLAMA_LIBRARY_URL}/search?c={cat}"
             if page_num == 1
-            else f"{OLLAMA_LIBRARY}/search?c={cat}&p={page_num}"
+            else f"{OLLAMA_LIBRARY_URL}/search?c={cat}&p={page_num}"
         )
         if verbose:
-            print(f"  fetch {url}")
-        page = _fetch(url)
+            logger.debug("fetch %s", url)
+        page = fetch_text(url)
         if not page:
             break
         found = _parse_library_page(page)
@@ -102,13 +103,13 @@ def _fetch_full_library(verbose: bool = False) -> list[str]:
     families: list[str] = []
     for page_num in range(1, 11):
         url = (
-            f"{OLLAMA_LIBRARY}/library"
+            f"{OLLAMA_LIBRARY_URL}/library"
             if page_num == 1
-            else f"{OLLAMA_LIBRARY}/library?p={page_num}"
+            else f"{OLLAMA_LIBRARY_URL}/library?p={page_num}"
         )
         if verbose:
-            print(f"  fetch {url}")
-        page = _fetch(url)
+            logger.debug("fetch %s", url)
+        page = fetch_text(url)
         if not page:
             break
         found = _parse_library_page(page)
@@ -126,7 +127,7 @@ _CAPABILITY_RE = re.compile(
 
 def model_capabilities(family: str) -> set[str]:
     """Return the capability badges shown on https://ollama.com/library/<family>."""
-    page = _fetch(f"{OLLAMA_LIBRARY}/library/{family}")
+    page = fetch_text(f"{OLLAMA_LIBRARY_URL}/library/{family}")
     if not page:
         return set()
     return {m.lower() for m in _CAPABILITY_RE.findall(page)}
@@ -154,18 +155,18 @@ def discover_models(
     """
     library = _fetch_full_library(verbose=verbose)
     if verbose:
-        print(f"  full library: {len(library)} families")
+        logger.debug("full library: %d families", len(library))
     if not library:
         return [], set()
 
     code = _fetch_category("code", verbose=verbose)
     code_set = set(code)
     if verbose:
-        print(f"  code category: {len(code)} families")
+        logger.debug("code category: %d families", len(code))
 
     # Parallel capability probe — the slow step, so we fan out.
     tool_families: list[str] = []
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=OLLAMA_VERIFY_WORKERS) as pool:
         futures = {pool.submit(model_capabilities, fam): fam for fam in library}
         done = 0
         for fut in as_completed(futures):
@@ -176,11 +177,12 @@ def discover_models(
             try:
                 caps = fut.result()
             except Exception:
+                logger.debug("Failed to get capabilities for %s", fam, exc_info=True)
                 caps = set()
             if "tools" in caps:
                 tool_families.append(fam)
                 if verbose:
-                    print(f"  tools ok: {fam}  {sorted(caps)}")
+                    logger.debug("tools ok: %s  %s", fam, sorted(caps))
 
     # Preserve library order (popularity-ranked by ollama.com).
     order_index = {fam: i for i, fam in enumerate(library)}
@@ -214,20 +216,16 @@ def _tag_to_size_b(tag: str) -> float:
     return 0.0
 
 
-def _estimate_vram_mb(size_b: float) -> int:
-    return int(size_b * 600 + 1024)
-
-
 def _fetch_authoritative_tags(family: str, verbose: bool = False) -> list[tuple[str, float]]:
-    url = f"{OLLAMA_LIBRARY}/library/{family}/tags"
+    url = f"{OLLAMA_LIBRARY_URL}/library/{family}/tags"
     if verbose:
-        print(f"  fetch {url}")
-    page = _fetch(url)
+        logger.debug("fetch %s", url)
+    page = fetch_text(url)
     if not page:
         return []
     tags = _parse_model_tags(page)
     if not tags:
-        main = _fetch(f"{OLLAMA_LIBRARY}/library/{family}")
+        main = fetch_text(f"{OLLAMA_LIBRARY_URL}/library/{family}")
         if main:
             tags = _parse_model_tags(main)
     return tags
@@ -247,24 +245,20 @@ def expand_candidates(
     """
     code_set = code_set or set()
 
-    vram = info.usable_vram_mb
-    if vram < 2048:
-        vram = int(info.ram_mb * 0.6)
-    if vram <= 0:
-        vram = 8192
+    vram = compute_vram_budget(info.usable_vram_mb, info.ram_mb, runtime="ollama")
 
     candidates: list[Candidate] = []
     for fam in families:
         tags = _fetch_authoritative_tags(fam, verbose=verbose)
         if not tags:
             if verbose:
-                print(f"  skip {fam} — no published tags")
+                logger.debug("skip %s — no published tags", fam)
             continue
         cats = ["tools"]
         if fam in code_set:
             cats.insert(0, "code")
         for tag, size_b in tags:
-            est = _estimate_vram_mb(size_b)
+            est = estimate_vram_ollama(size_b)
             if est > vram:
                 continue
             candidates.append(
@@ -289,7 +283,7 @@ def verify_candidates(
     already enforced upstream in `discover_models`, so this only gates tag existence.
     """
     verified: list[Candidate] = []
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=OLLAMA_VERIFY_WORKERS) as pool:
         futures = {pool.submit(verify_model_exists, c.model): c for c in candidates}
         for fut in as_completed(futures):
             c = futures[fut]
@@ -300,9 +294,9 @@ def verify_candidates(
             if ok:
                 verified.append(c)
                 if verbose:
-                    print(f"  ok {c.model}")
+                    logger.debug("ok %s", c.model)
             elif verbose:
-                print(f"  x {c.model} (not on ollama.com)")
+                logger.debug("x %s (not on ollama.com)", c.model)
     # Preserve the original ranking order.
     order = {c.model: i for i, c in enumerate(candidates)}
     verified.sort(key=lambda c: order[c.model])

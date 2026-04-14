@@ -8,24 +8,47 @@ that enforces Bearer authentication.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import ssl
 import time
 import urllib.error
 import urllib.request
-import ssl  # Added SSL module for security
 from dataclasses import dataclass
+
+from .utils import (
+    USER_AGENT,
+    HTTP_TIMEOUT_SHORT,
+    HTTP_TIMEOUT_BENCHMARK_WARMUP,
+    HTTP_TIMEOUT_BENCHMARK,
+    HTTP_TIMEOUT_PULL,
+    BENCH_MAX_TOKENS,
+)
+
+logger = logging.getLogger(__name__)
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()
 
 
 def _auth_headers(extra: dict | None = None) -> dict:
-    headers = {"User-Agent": "ollmatuning/0.1"}
+    headers = {"User-Agent": USER_AGENT}
     if OLLAMA_API_KEY:
         headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
     if extra:
         headers.update(extra)
     return headers
+
+
+def _make_ssl_context() -> ssl.SSLContext | None:
+    """Return a verified SSL context for HTTPS, or None for HTTP."""
+    if OLLAMA_HOST.startswith("https://"):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+    return None
+
 
 # Coding + tool-style prompts — representative of real use.
 BENCH_PROMPTS = [
@@ -58,7 +81,7 @@ class BenchResult:
 
     def summary(self) -> str:
         if not self.ok:
-            return f"{self.model}: FEHLER ({self.error})"
+            return f"{self.model}: ERROR ({self.error})"
         vram = f", {self.vram_mb} MB VRAM" if self.vram_mb else ""
         return (
             f"{self.model}: {self.tokens_per_sec:6.2f} tok/s "
@@ -66,42 +89,42 @@ class BenchResult:
         )
 
 
-def _http_post(path: str, payload: dict, timeout: int = 600) -> dict:
-    # Handle SSL context based on URL scheme
+def _http_post(path: str, payload: dict, timeout: int = HTTP_TIMEOUT_BENCHMARK_WARMUP) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{OLLAMA_HOST}{path}", data=data, headers=_auth_headers(), method="POST"
     )
+    ctx = _make_ssl_context()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        if ctx:
+            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        else:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
     except (urllib.error.URLError, ssl.SSLError) as e:
         raise RuntimeError(f"HTTP error: {e}") from e
 
 
-def _http_get(path: str, timeout: int = 10) -> dict:
-    # Handle SSL context based on URL scheme
-    if OLLAMA_HOST.startswith("https://"):
-        context = ssl.create_default_context()
-        context.check_hostname = True
-        context.verify_mode = ssl.CERT_REQUIRED
-        req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
-        try:
-            with urllib.request.urlopen(req, context=context, timeout=timeout) as r:
+def _http_get(path: str, timeout: int = HTTP_TIMEOUT_SHORT) -> dict:
+    req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
+    ctx = _make_ssl_context()
+    try:
+        if ctx:
+            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
-        except ssl.SSLError as e:
-            raise RuntimeError(f"SSL verification failed: {e}") from e
-    else:
-        req = urllib.request.Request(f"{OLLAMA_HOST}{path}", headers=_auth_headers())
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        else:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+    except ssl.SSLError as e:
+        raise RuntimeError(f"SSL verification failed: {e}") from e
 
 
 def ollama_is_up() -> bool:
     try:
         _http_get("/api/tags", timeout=3)
         return True
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, RuntimeError):
         return False
 
 
@@ -109,6 +132,7 @@ def list_local_models() -> list[str]:
     try:
         data = _http_get("/api/tags")
     except Exception:
+        logger.debug("Failed to list local models", exc_info=True)
         return []
     return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
 
@@ -122,8 +146,13 @@ def pull_model(model: str, verbose: bool = True) -> bool:
         headers=_auth_headers({"Content-Type": "application/json"}),
         method="POST",
     )
+    ctx = _make_ssl_context()
     try:
-        with urllib.request.urlopen(req, timeout=3600) as r:
+        if ctx:
+            r = urllib.request.urlopen(req, context=ctx, timeout=HTTP_TIMEOUT_PULL)
+        else:
+            r = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_PULL)
+        with r:
             last_status = ""
             for raw in r:
                 if not raw:
@@ -131,19 +160,20 @@ def pull_model(model: str, verbose: bool = True) -> bool:
                 try:
                     obj = json.loads(raw.decode("utf-8"))
                 except json.JSONDecodeError:
+                    logger.debug("Non-JSON line in pull stream for %s", model)
                     continue
                 status = obj.get("status", "")
                 if "error" in obj:
                     if verbose:
-                        print(f"    pull error: {obj['error']}")
+                        logger.info("Pull error for %s: %s", model, obj["error"])
                     return False
                 if verbose and status and status != last_status:
-                    print(f"    {status}")
+                    logger.info("%s: %s", model, status)
                     last_status = status
             return True
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         if verbose:
-            print(f"    pull failed: {e}")
+            logger.warning("Pull failed for %s: %s", model, e)
         return False
 
 
@@ -157,7 +187,7 @@ def _get_model_vram(model: str) -> int:
                 size_bytes = m.get("size_vram", 0) or m.get("size", 0)
                 return int(size_bytes / (1024 * 1024))
     except Exception:
-        pass
+        logger.debug("Failed to query VRAM for %s", model, exc_info=True)
     return 0
 
 
@@ -173,7 +203,7 @@ def benchmark_model(model: str, prompts: list[tuple[str, str]] | None = None) ->
             "prompt": "Hi.",
             "stream": False,
             "options": {"num_predict": 8},
-        }, timeout=600)
+        }, timeout=HTTP_TIMEOUT_BENCHMARK_WARMUP)
 
         # Measure actual VRAM after model is loaded.
         vram_mb = _get_model_vram(model)
@@ -183,8 +213,8 @@ def benchmark_model(model: str, prompts: list[tuple[str, str]] | None = None) ->
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"num_predict": 256, "temperature": 0.0},
-            }, timeout=1200)
+                "options": {"num_predict": BENCH_MAX_TOKENS, "temperature": 0.0},
+            }, timeout=HTTP_TIMEOUT_BENCHMARK)
             total_tokens += int(resp.get("eval_count", 0))
             total_eval_ns += int(resp.get("eval_duration", 0))
 

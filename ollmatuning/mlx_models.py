@@ -10,20 +10,27 @@ safetensors file sizes, and produces Candidate objects.
 """
 from __future__ import annotations
 
-import json
+import logging
 import re
-import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from .system import SystemInfo
+from .utils import (
+    HF_API_BASE,
+    HTTP_TIMEOUT_MEDIUM,
+    HF_FETCH_WORKERS,
+    fetch_json,
+    guess_param_size,
+    detect_categories,
+    compute_vram_budget,
+    estimate_vram_mlx,
+)
 
-HF_API = "https://huggingface.co/api"
-USER_AGENT = "ollmatuning/0.1 (+https://github.com/)"
+logger = logging.getLogger(__name__)
 
 _QUANT_RE = re.compile(r"[-_]((\d+)[\s-]?bit)", re.IGNORECASE)
-_PARAM_RE = re.compile(r"[-_.](\d+(?:\.\d+)?)[Bb][-_.]")
 
 
 @dataclass
@@ -37,17 +44,8 @@ class MLXModel:
 
     @property
     def est_vram_mb(self) -> int:
-        """MLX memory-maps weights. VRAM ~ file size + ~300 MB overhead."""
-        return int(self.safetensor_bytes / (1024**2) + 300)
-
-
-def _fetch_json(url: str, timeout: int = 20) -> dict | list | None:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", errors="replace"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
-        return None
+        """MLX memory-maps weights. VRAM ~ file size + overhead."""
+        return estimate_vram_mlx(self.safetensor_bytes)
 
 
 def _parse_quant_bits(repo_id: str) -> int:
@@ -65,18 +63,6 @@ def _parse_quant_bits(repo_id: str) -> int:
     return 0
 
 
-def _guess_param_size(repo_id: str) -> float:
-    """Try to extract parameter count (in billions) from repo name."""
-    m = _PARAM_RE.search(repo_id)
-    if m:
-        return float(m.group(1))
-    # Try looser pattern
-    m2 = re.search(r"(\d+(?:\.\d+)?)\s*[Bb]", repo_id.replace("-", " "))
-    if m2:
-        return float(m2.group(1))
-    return 0.0
-
-
 def search_mlx_models(
     query: str = "",
     limit: int = 40,
@@ -86,11 +72,11 @@ def search_mlx_models(
     params = f"filter=mlx&sort=downloads&direction=-1&limit={limit}"
     if query:
         params += f"&search={urllib.request.quote(query)}"
-    url = f"{HF_API}/models?{params}"
+    url = f"{HF_API_BASE}/models?{params}"
     if verbose:
-        print(f"  MLX search: {url}")
+        logger.debug("MLX search: %s", url)
 
-    data = _fetch_json(url)
+    data = fetch_json(url)
     if not data or not isinstance(data, list):
         return []
 
@@ -113,17 +99,17 @@ def search_mlx_models(
         ))
 
     if verbose:
-        print(f"  MLX found {len(models)} repos")
+        logger.debug("MLX found %d repos", len(models))
     return models
 
 
 def fetch_mlx_model_size(model: MLXModel, verbose: bool = False) -> None:
     """Populate safetensor_bytes by reading the repo's file listing."""
-    url = f"{HF_API}/models/{model.repo_id}?blobs=true"
+    url = f"{HF_API_BASE}/models/{model.repo_id}?blobs=true"
     if verbose:
-        print(f"  MLX files: {url}")
+        logger.debug("MLX files: %s", url)
 
-    data = _fetch_json(url, timeout=15)
+    data = fetch_json(url, timeout=HTTP_TIMEOUT_MEDIUM)
     if not data or not isinstance(data, dict):
         return
 
@@ -155,10 +141,10 @@ def discover_mlx_models(
                 all_models.append(m)
 
     if verbose:
-        print(f"  MLX total unique repos: {len(all_models)}")
+        logger.debug("MLX total unique repos: %d", len(all_models))
 
     # Fetch file sizes in parallel.
-    with ThreadPoolExecutor(max_workers=12) as pool:
+    with ThreadPoolExecutor(max_workers=HF_FETCH_WORKERS) as pool:
         futures = {pool.submit(fetch_mlx_model_size, m, verbose): m for m in all_models}
         done = 0
         for fut in as_completed(futures):
@@ -169,14 +155,14 @@ def discover_mlx_models(
             try:
                 fut.result()
             except Exception:
-                pass
+                logger.debug("Failed to fetch sizes for %s", m.repo_id, exc_info=True)
 
     # Keep only repos that have safetensors files.
     with_files = [m for m in all_models if m.safetensor_bytes > 0]
     with_files.sort(key=lambda m: m.downloads, reverse=True)
 
     if verbose:
-        print(f"  MLX repos with safetensors: {len(with_files)}")
+        logger.debug("MLX repos with safetensors: %d", len(with_files))
 
     return with_files
 
@@ -207,8 +193,7 @@ def expand_mlx_candidates(
     """
     from .recommend import Candidate
 
-    # Apple Silicon uses unified memory — entire RAM is available.
-    budget_mb = int(info.ram_mb * 0.75) if info.ram_mb > 0 else 16384
+    budget_mb = compute_vram_budget(info.usable_vram_mb, info.ram_mb, runtime="mlx")
 
     # Group by base model name, pick best quant per group.
     # "Best" = smallest quant that fits, preferring 4-bit.
@@ -217,7 +202,7 @@ def expand_mlx_candidates(
     for m in models:
         if m.est_vram_mb > budget_mb:
             if verbose:
-                print(f"  MLX skip {m.repo_id} — {m.est_vram_mb} MB > {budget_mb} MB budget")
+                logger.debug("MLX skip %s — %d MB > %d MB budget", m.repo_id, m.est_vram_mb, budget_mb)
             continue
         base = _normalize_base_name(m.repo_id)
         groups.setdefault(base, []).append(m)
@@ -228,23 +213,18 @@ def expand_mlx_candidates(
         variants.sort(key=lambda v: (QUANT_PREF.get(v.quant_bits, 99), -v.downloads))
         best_per_group.append(variants[0])
         if verbose and len(variants) > 1:
-            print(f"  MLX dedup {base}: picked {variants[0].repo_id} "
-                  f"(dropped {len(variants)-1} variants)")
+            logger.debug(
+                "MLX dedup %s: picked %s (dropped %d variants)",
+                base, variants[0].repo_id, len(variants) - 1,
+            )
 
     # Sort by downloads for final ordering.
     best_per_group.sort(key=lambda m: m.downloads, reverse=True)
 
     candidates: list[Candidate] = []
     for m in best_per_group:
-        size_b = _guess_param_size(m.repo_id)
-        cats: list[str] = []
-        lower_id = m.repo_id.lower()
-        if any(k in lower_id for k in ("code", "coder", "coding")):
-            cats.append("code")
-        if any(k in lower_id for k in ("tool", "function", "func-call")):
-            cats.append("tools")
-        if not cats:
-            cats.append("general")
+        size_b = guess_param_size(m.repo_id)
+        cats = detect_categories(m.repo_id.lower())
 
         candidates.append(Candidate(
             model=m.repo_id,

@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import platform
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -161,7 +164,7 @@ def _detect_macos_gpus() -> list[GPU]:
                 vendor = "apple" if "apple" in str(name).lower() else "unknown"
                 gpus.append(GPU(name=str(name), vendor=vendor, vram_mb=vram_mb))
         except json.JSONDecodeError:
-            pass
+            logger.debug("Failed to parse macOS GPU data", exc_info=True)
     # Apple Silicon uses unified memory — fall back to total RAM if VRAM missing.
     if gpus and platform.machine().lower() in ("arm64", "aarch64"):
         for g in gpus:
@@ -176,6 +179,7 @@ def _macos_total_ram_mb() -> int:
     rc, out, _ = _run(["sysctl", "-n", "hw.memsize"])
     if rc == 0 and out.strip().isdigit():
         return int(out.strip()) // (1024 * 1024)
+    logger.warning("Could not detect macOS total RAM")
     return 0
 
 
@@ -195,7 +199,7 @@ def _total_ram_mb() -> int:
                     if line.startswith("MemTotal:"):
                         return int(line.split()[1]) // 1024
         except OSError:
-            pass
+            logger.debug("Could not read /proc/meminfo", exc_info=True)
     elif system == "Darwin":
         return _macos_total_ram_mb()
     return 0
@@ -217,7 +221,7 @@ def _cpu_name() -> str:
                     if line.lower().startswith("model name"):
                         return line.split(":", 1)[1].strip()
         except OSError:
-            pass
+            logger.debug("Could not read /proc/cpuinfo", exc_info=True)
     elif system == "Darwin":
         rc, out, _ = _run(["sysctl", "-n", "machdep.cpu.brand_string"])
         if rc == 0:

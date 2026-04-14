@@ -11,9 +11,14 @@ Measures actual Metal GPU memory usage via mlx.core.metal APIs.
 """
 from __future__ import annotations
 
+import gc
+import logging
 import time
 
 from .benchmark import BenchResult, BENCH_PROMPTS
+from .utils import BENCH_MAX_TOKENS
+
+logger = logging.getLogger(__name__)
 
 
 def mlx_lm_available() -> bool:
@@ -33,6 +38,7 @@ def _metal_memory_mb() -> tuple[int, int]:
         peak = mx.metal.get_peak_memory() // (1024 * 1024)
         return active, peak
     except Exception:
+        logger.debug("Failed to read Metal memory stats", exc_info=True)
         return 0, 0
 
 
@@ -41,6 +47,21 @@ def _reset_peak_memory() -> None:
     try:
         import mlx.core as mx
         mx.metal.reset_peak_memory()
+    except Exception:
+        logger.debug("Failed to reset Metal peak memory", exc_info=True)
+
+
+def _cleanup_model(model=None, tokenizer=None) -> None:
+    """Release MLX model and tokenizer to free Metal GPU memory.
+
+    Called after benchmarking to prevent OOM when testing multiple models.
+    """
+    del model
+    del tokenizer
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.eval(mx.zeros(1))  # Force synchronous evaluation to flush ops
     except Exception:
         pass
 
@@ -66,6 +87,7 @@ def is_model_cached(repo_id: str) -> bool:
                         return True
         return False
     except Exception:
+        logger.debug("Failed to check cache for %s", repo_id, exc_info=True)
         return False
 
 
@@ -75,7 +97,7 @@ def _try_load_cached(repo_id: str) -> str | None:
     Returns the local snapshot path if fully cached, None otherwise.
     """
     try:
-        from huggingface_hub import try_to_load_from_cache, scan_cache_dir
+        from huggingface_hub import scan_cache_dir
         cache = scan_cache_dir()
         for repo in cache.repos:
             if repo.repo_id == repo_id:
@@ -88,6 +110,7 @@ def _try_load_cached(repo_id: str) -> str | None:
                         return str(revision.snapshot_path)
         return None
     except Exception:
+        logger.debug("Failed to load cached path for %s", repo_id, exc_info=True)
         return None
 
 
@@ -107,12 +130,13 @@ def download_mlx_model(repo_id: str, verbose: bool = True) -> str | None:
     cached_path = _try_load_cached(repo_id)
     if cached_path:
         if verbose:
-            print(f"    {repo_id}: using cached version (no download)")
+            logger.info("%s: using cached version (no download)", repo_id)
         return cached_path
 
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
+        logger.error("huggingface_hub not installed — cannot download %s", repo_id)
         return None
 
     try:
@@ -130,19 +154,17 @@ def download_mlx_model(repo_id: str, verbose: bool = True) -> str | None:
         return local_dir
     except KeyboardInterrupt:
         if verbose:
-            print(f"\n    Download paused for {repo_id}. "
-                  "Run again to resume where you left off.")
+            logger.info("Download paused for %s. Run again to resume.", repo_id)
         raise
     except Exception as e:
-        if verbose:
-            print(f"    Download failed: {e}")
+        logger.error("Download failed for %s: %s", repo_id, e)
         return None
 
 
 def benchmark_mlx_model(
     repo_id: str,
     prompts: list[tuple[str, str]] | None = None,
-    max_tokens: int = 256,
+    max_tokens: int = BENCH_MAX_TOKENS,
 ) -> BenchResult:
     """Benchmark a single MLX model from HuggingFace.
 
@@ -150,6 +172,7 @@ def benchmark_mlx_model(
     2. Downloads/resumes if needed
     3. Loads via mlx-lm
     4. Measures tokens/second + actual Metal GPU memory
+    5. Cleans up model to free memory
     """
     prompts = prompts or BENCH_PROMPTS
 
@@ -182,12 +205,15 @@ def benchmark_mlx_model(
         )
 
     # Step 2: Load into MLX.
+    model = None
+    tokenizer = None
     try:
         _reset_peak_memory()
         model, tokenizer = load(local_path)
         vram_mb, _ = _metal_memory_mb()
         _reset_peak_memory()
     except Exception as e:
+        _cleanup_model(model, tokenizer)
         return BenchResult(
             model=repo_id,
             tokens_per_sec=0.0,
@@ -221,6 +247,7 @@ def benchmark_mlx_model(
             total_eval_s += gen_end - gen_start
 
     except Exception as e:
+        _cleanup_model(model, tokenizer)
         return BenchResult(
             model=repo_id,
             tokens_per_sec=0.0,
@@ -231,8 +258,9 @@ def benchmark_mlx_model(
             error=f"Generate failed: {e}",
         )
 
-    # Step 4: Measure peak memory.
+    # Step 4: Measure peak memory, then clean up.
     _, peak_mb = _metal_memory_mb()
+    _cleanup_model(model, tokenizer)
 
     tps = (total_tokens / total_eval_s) if total_eval_s > 0 else 0.0
     return BenchResult(

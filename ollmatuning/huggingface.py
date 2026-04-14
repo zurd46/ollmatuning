@@ -11,17 +11,27 @@ recommend → benchmark pipeline.
 """
 from __future__ import annotations
 
-import json
+import logging
 import re
-import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from .system import SystemInfo
+from .utils import (
+    HF_API_BASE,
+    USER_AGENT,
+    HTTP_TIMEOUT_MEDIUM,
+    HTTP_TIMEOUT_LONG,
+    HF_FETCH_WORKERS,
+    fetch_json,
+    guess_param_size,
+    detect_categories,
+    compute_vram_budget,
+    estimate_vram_gguf,
+)
 
-HF_API = "https://huggingface.co/api"
-USER_AGENT = "ollmatuning/0.1 (+https://github.com/)"
+logger = logging.getLogger(__name__)
 
 # Quantization levels ordered from smallest to largest (roughly).
 QUANT_PREFERENCE = [
@@ -42,10 +52,6 @@ _QUANT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Regex to guess parameter count from repo/model name.
-_PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[Bb](?:illion)?", re.IGNORECASE)
-_PARAM_NAME_RE = re.compile(r"[-_.](\d+(?:\.\d+)?)[Bb][-_.]")
-
 
 @dataclass
 class GGUFFile:
@@ -59,8 +65,8 @@ class GGUFFile:
 
     @property
     def est_vram_mb(self) -> int:
-        """GGUF file size ≈ model weight size. VRAM ≈ file + ~500 MB overhead."""
-        return int(self.size_bytes / (1024**2) + 500)
+        """GGUF file size ≈ model weight size. VRAM ≈ file + overhead."""
+        return estimate_vram_gguf(self.size_bytes)
 
 
 @dataclass
@@ -91,15 +97,6 @@ class HFModel:
         return fitting[0]
 
 
-def _fetch_json(url: str, timeout: int = 20) -> dict | list | None:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", errors="replace"))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
-        return None
-
-
 def search_gguf_models(
     query: str = "",
     limit: int = 40,
@@ -115,11 +112,11 @@ def search_gguf_models(
     )
     if query:
         params += f"&search={urllib.request.quote(query)}"
-    url = f"{HF_API}/models?{params}"
+    url = f"{HF_API_BASE}/models?{params}"
     if verbose:
-        print(f"  HF search: {url}")
+        logger.debug("HF search: %s", url)
 
-    data = _fetch_json(url)
+    data = fetch_json(url)
     if not data or not isinstance(data, list):
         return []
 
@@ -141,17 +138,17 @@ def search_gguf_models(
         ))
 
     if verbose:
-        print(f"  HF found {len(models)} GGUF repos")
+        logger.debug("HF found %d GGUF repos", len(models))
     return models
 
 
 def fetch_gguf_files(model: HFModel, verbose: bool = False) -> None:
     """Populate model.gguf_files by reading the repo's file listing."""
-    url = f"{HF_API}/models/{model.repo_id}?blobs=true"
+    url = f"{HF_API_BASE}/models/{model.repo_id}?blobs=true"
     if verbose:
-        print(f"  HF files: {url}")
+        logger.debug("HF files: %s", url)
 
-    data = _fetch_json(url, timeout=15)
+    data = fetch_json(url, timeout=HTTP_TIMEOUT_MEDIUM)
     if not data or not isinstance(data, dict):
         return
 
@@ -170,17 +167,6 @@ def fetch_gguf_files(model: HFModel, verbose: bool = False) -> None:
             quant=quant,
             size_bytes=size,
         ))
-
-
-def _guess_param_size(repo_id: str) -> float:
-    """Try to extract parameter count (in billions) from repo name."""
-    m = _PARAM_NAME_RE.search(repo_id)
-    if m:
-        return float(m.group(1))
-    m = _PARAM_RE.search(repo_id.replace("-", " "))
-    if m:
-        return float(m.group(1))
-    return 0.0
 
 
 def discover_hf_models(
@@ -203,10 +189,10 @@ def discover_hf_models(
                 all_models.append(m)
 
     if verbose:
-        print(f"  HF total unique repos: {len(all_models)}")
+        logger.debug("HF total unique repos: %d", len(all_models))
 
     # Fetch file listings in parallel.
-    with ThreadPoolExecutor(max_workers=12) as pool:
+    with ThreadPoolExecutor(max_workers=HF_FETCH_WORKERS) as pool:
         futures = {pool.submit(fetch_gguf_files, m, verbose): m for m in all_models}
         done = 0
         for fut in as_completed(futures):
@@ -217,7 +203,7 @@ def discover_hf_models(
             try:
                 fut.result()
             except Exception:
-                pass
+                logger.debug("Failed to fetch files for %s", m.repo_id, exc_info=True)
 
     # Keep only repos that have actual GGUF files.
     with_files = [m for m in all_models if m.gguf_files]
@@ -225,7 +211,7 @@ def discover_hf_models(
     with_files.sort(key=lambda m: m.downloads, reverse=True)
 
     if verbose:
-        print(f"  HF repos with GGUF files: {len(with_files)}")
+        logger.debug("HF repos with GGUF files: %d", len(with_files))
 
     return with_files
 
@@ -238,30 +224,20 @@ def expand_hf_candidates(
     """Convert HF models into Candidate objects that fit VRAM budget."""
     from .recommend import Candidate
 
-    vram = info.usable_vram_mb
-    if vram < 2048:
-        vram = int(info.ram_mb * 0.6)
-    if vram <= 0:
-        vram = 8192
+    vram = compute_vram_budget(info.usable_vram_mb, info.ram_mb, runtime="ollama")
 
     candidates: list[Candidate] = []
     for m in models:
         best = m.best_quant_for_vram(vram)
         if not best:
             if verbose:
-                print(f"  HF skip {m.repo_id} — no quant fits {vram} MB")
+                logger.debug("HF skip %s — no quant fits %d MB", m.repo_id, vram)
             continue
 
-        size_b = _guess_param_size(m.repo_id)
+        size_b = guess_param_size(m.repo_id)
         # Determine categories from tags/name.
-        cats: list[str] = []
         lower_tags = " ".join(m.tags).lower() + " " + m.repo_id.lower()
-        if any(k in lower_tags for k in ("code", "coder", "coding")):
-            cats.append("code")
-        if any(k in lower_tags for k in ("tool", "function", "func-call")):
-            cats.append("tools")
-        if not cats:
-            cats.append("general")
+        cats = detect_categories(lower_tags)
 
         ollama_model = f"hf.co/{m.repo_id}:{best.quant}"
         candidates.append(Candidate(
