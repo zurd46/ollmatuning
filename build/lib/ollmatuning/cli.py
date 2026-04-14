@@ -134,8 +134,12 @@ def _sort_candidates(cands: list[Candidate]) -> list[Candidate]:
 
 def _run_benchmark_pipeline(
     candidates: list[Candidate],
+    allow_download: bool = False,
 ) -> list[BenchResult]:
     """Benchmark a list of candidates, dispatching MLX vs Ollama per model.
+
+    By default, only benchmarks models already downloaded locally.
+    Pass allow_download=True (--download flag) to fetch missing models.
 
     KeyboardInterrupt during a single model skips to the next one.
     For MLX downloads, Ctrl+C during download saves progress — rerun resumes.
@@ -145,6 +149,7 @@ def _run_benchmark_pipeline(
     local = set(list_local_models()) if ollama_is_up() else set()
     results: list[BenchResult] = []
     skipped_count = 0
+    download_skipped: list[str] = []
 
     with ui.make_progress() as progress:
         task = progress.add_task("Benchmark pipeline", total=len(candidates))
@@ -156,8 +161,14 @@ def _run_benchmark_pipeline(
                     cached = is_model_cached(model)
                     if cached:
                         progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] → cached, benchmarking")
-                    else:
+                    elif allow_download:
                         progress.update(task, description=f"[yellow]{model}[/yellow] → downloading (Ctrl+C to skip)")
+                    else:
+                        progress.update(task, description=f"[dim]{model}[/dim] → not cached, skipping")
+                        download_skipped.append(model)
+                        results.append(BenchResult(model, 0, 0, 0, 0, False, "not downloaded (use --download)"))
+                        progress.advance(task)
+                        continue
                     r = benchmark_mlx_model(model)
                 else:
                     # GGUF / Ollama path
@@ -191,6 +202,12 @@ def _run_benchmark_pipeline(
 
     if skipped_count:
         ui.info(f"{skipped_count} model(s) skipped. Run again to resume downloads.")
+
+    if download_skipped:
+        ui.warn(f"{len(download_skipped)} model(s) not downloaded — skipped:")
+        for m in download_skipped:
+            ui.info(f"  • {m}")
+        ui.info("Re-run with [bold bright_cyan]--download[/bold bright_cyan] to fetch and benchmark them.")
 
     return results
 
@@ -281,7 +298,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         ui.show_candidates(cands, title=f"{len(cands)} candidates to benchmark")
         candidates = cands
 
-    results = _run_benchmark_pipeline(candidates)
+    results = _run_benchmark_pipeline(candidates, allow_download=getattr(args, "download", False))
     ui.show_results(results)
 
     ok_results = sorted(
@@ -351,7 +368,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
     ui.show_candidates(cands, title=f"Top {len(cands)} {fmt_name} models for your hardware")
 
     ui.step("Step 4/4: benchmarking tok/s")
-    results = _run_benchmark_pipeline(cands)
+    results = _run_benchmark_pipeline(cands, allow_download=getattr(args, "download", False))
     ui.show_results(results)
 
     ok = sorted([r for r in results if r.ok], key=lambda r: r.tokens_per_sec, reverse=True)
@@ -447,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sp = sub.add_parser("auto", help="All-in-one (detect -> search -> benchmark -> set)")
     _add_common_flags(sp)
+    sp.add_argument("--download", action="store_true",
+                    help="Download missing models (default: only benchmark cached)")
     sp.add_argument("--no-save", action="store_true", help="Do not save the winner")
     sp.set_defaults(func=cmd_auto)
 
@@ -463,6 +482,8 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("benchmark", help="Pull/download candidates and measure tok/s")
     _add_common_flags(sp)
     sp.add_argument("--models", nargs="+", help="Explicit models (skips auto selection)")
+    sp.add_argument("--download", action="store_true",
+                    help="Download missing models (default: only benchmark cached)")
     sp.add_argument("--set-best", action="store_true", help="Save winner to ~/.ollmatuning/config.json")
     sp.set_defaults(func=cmd_benchmark)
 
