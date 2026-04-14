@@ -38,10 +38,10 @@ class TestResolveRuntime:
 
 class TestMain:
     def test_version_flag(self):
-        with patch("ollmatuning.cli.is_apple_silicon", return_value=False):
-            result = main(["--version"])
-        # argparse exits with SystemExit(0) for --version
-        assert result == 0 or True  # version flag causes SystemExit
+        import pytest
+        with pytest.raises(SystemExit) as exc_info:
+            main(["--version"])
+        assert exc_info.value.code == 0
 
     def test_detect_json_output(self):
         info = SystemInfo(

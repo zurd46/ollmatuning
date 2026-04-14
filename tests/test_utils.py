@@ -29,9 +29,10 @@ class TestGuessParamSize:
     def test_no_param_match(self):
         assert guess_param_size("some-random-model") == 0.0
 
-    def test_multiple_matches_picks_first(self):
-        # _PARAM_NAME_RE matches first, should get 7
-        assert guess_param_size("7B-13B-model") == 7.0
+    def test_multiple_matches_looser_pattern(self):
+        # "7B" at string start doesn't match _PARAM_NAME_RE (needs delimiter before),
+        # so the looser pattern picks up "13B"
+        assert guess_param_size("7B-13B-model") == 13.0
 
 
 class TestDetectCategories:

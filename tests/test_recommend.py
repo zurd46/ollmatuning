@@ -15,7 +15,7 @@ class TestCandidate:
         c = Candidate(model="codellama:7b", family="codellama", size_b=7.0,
                       est_vram_mb=5200, categories=["code", "tools"])
         assert "7B" in c.pretty
-        assert "5200 MB" in c.p
+        assert "5200 MB" in c.pretty
 
     def test_default_runtime(self):
         c = Candidate(model="test", family="test", size_b=1, est_vram_mb=100, categories=[])
