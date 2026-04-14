@@ -213,7 +213,7 @@ def benchmark_mlx_model(
             model, tokenizer = load(local_path)
         except ValueError:
             # Retry with strict=False for models with extra parameters (e.g. bias)
-            from mlx_lm.utils import load_tokenizer
+            from mlx_lm.utils import load_model, load_tokenizer
             model, _ = load_model(local_path, strict=False)
             tokenizer = load_tokenizer(local_path)
         vram_mb, _ = _metal_memory_mb()
