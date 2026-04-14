@@ -12,7 +12,6 @@ Measures actual Metal GPU memory usage via mlx.core.metal APIs.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 from .benchmark import BenchResult, BENCH_PROMPTS
 
@@ -46,15 +45,71 @@ def _reset_peak_memory() -> None:
         pass
 
 
+def is_model_cached(repo_id: str) -> bool:
+    """Check if a model is fully cached locally (no network needed).
+
+    Verifies that the repo exists in the HF cache AND has at least one
+    .safetensors file downloaded (not just metadata).
+    """
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache = scan_cache_dir()
+        for repo in cache.repos:
+            if repo.repo_id == repo_id:
+                # Check that actual model files exist, not just metadata.
+                for revision in repo.revisions:
+                    has_weights = any(
+                        f.file_name.endswith(".safetensors")
+                        for f in revision.files
+                    )
+                    if has_weights:
+                        return True
+        return False
+    except Exception:
+        return False
+
+
+def _try_load_cached(repo_id: str) -> str | None:
+    """Try to get the local cache path without any network calls.
+
+    Returns the local snapshot path if fully cached, None otherwise.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache, scan_cache_dir
+        cache = scan_cache_dir()
+        for repo in cache.repos:
+            if repo.repo_id == repo_id:
+                for revision in repo.revisions:
+                    has_weights = any(
+                        f.file_name.endswith(".safetensors")
+                        for f in revision.files
+                    )
+                    if has_weights:
+                        return str(revision.snapshot_path)
+        return None
+    except Exception:
+        return None
+
+
 def download_mlx_model(repo_id: str, verbose: bool = True) -> str | None:
     """Download/resume an MLX model from HuggingFace. Returns local cache path.
+
+    - If fully cached: returns path instantly (no network)
+    - If partially cached: resumes download
+    - If new: downloads from scratch
 
     Uses huggingface_hub.snapshot_download() which:
     - Resumes interrupted downloads automatically (.incomplete files)
     - Shows progress bars per file
     - Caches in ~/.cache/huggingface/hub/
-    - Skips already-downloaded files instantly
     """
+    # Fast path: already fully cached → no network needed.
+    cached_path = _try_load_cached(repo_id)
+    if cached_path:
+        if verbose:
+            print(f"    {repo_id}: using cached version (no download)")
+        return cached_path
+
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
@@ -63,7 +118,6 @@ def download_mlx_model(repo_id: str, verbose: bool = True) -> str | None:
     try:
         local_dir = snapshot_download(
             repo_id,
-            # Only download model weights + config, skip READMEs etc.
             allow_patterns=[
                 "*.safetensors",
                 "*.json",
@@ -85,20 +139,6 @@ def download_mlx_model(repo_id: str, verbose: bool = True) -> str | None:
         return None
 
 
-def is_model_cached(repo_id: str) -> bool:
-    """Check if a model is already fully cached locally."""
-    try:
-        from huggingface_hub import try_to_load_from_cache, scan_cache_dir
-        cache = scan_cache_dir()
-        for repo in cache.repos:
-            if repo.repo_id == repo_id:
-                # Has at least some revisions cached
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def benchmark_mlx_model(
     repo_id: str,
     prompts: list[tuple[str, str]] | None = None,
@@ -106,9 +146,10 @@ def benchmark_mlx_model(
 ) -> BenchResult:
     """Benchmark a single MLX model from HuggingFace.
 
-    1. Downloads/resumes model (cached by huggingface_hub)
-    2. Loads via mlx-lm
-    3. Measures tokens/second + actual Metal GPU memory
+    1. Checks cache first (no network if already downloaded)
+    2. Downloads/resumes if needed
+    3. Loads via mlx-lm
+    4. Measures tokens/second + actual Metal GPU memory
     """
     prompts = prompts or BENCH_PROMPTS
 
@@ -127,7 +168,7 @@ def benchmark_mlx_model(
 
     t0 = time.perf_counter()
 
-    # Step 1: Download/resume model files.
+    # Step 1: Download/cache check.
     local_path = download_mlx_model(repo_id)
     if local_path is None:
         return BenchResult(
