@@ -50,7 +50,7 @@ def _make_ssl_context() -> ssl.SSLContext | None:
     return None
 
 
-# Coding + tool-style prompts — representative of real use.
+# Coding + tool-style + reasoning prompts — representative of real use.
 BENCH_PROMPTS = [
     (
         "code",
@@ -63,6 +63,13 @@ BENCH_PROMPTS = [
         "You can call the function `get_weather(city: str) -> dict`. The user asks: "
         "'What is the weather in Berlin and Tokyo right now?'. Respond with a JSON "
         "array of the exact function calls you would make, nothing else.",
+    ),
+    (
+        "reasoning",
+        "A farmer has a wolf, a goat, and a cabbage. He needs to cross a river but "
+        "his boat can only carry him and one item at a time. If left alone, the wolf "
+        "will eat the goat, and the goat will eat the cabbage. What is the minimum "
+        "number of crossings needed? Explain step by step.",
     ),
 ]
 
@@ -87,6 +94,20 @@ class BenchResult:
             f"{self.model}: {self.tokens_per_sec:6.2f} tok/s "
             f"({self.eval_count} tok in {self.eval_seconds:.2f}s{vram})"
         )
+
+    def to_dict(self) -> dict:
+        """Serialize to a plain dict for JSON output."""
+        return {
+            "model": self.model,
+            "tokens_per_sec": self.tokens_per_sec,
+            "eval_count": self.eval_count,
+            "eval_seconds": self.eval_seconds,
+            "total_seconds": self.total_seconds,
+            "ok": self.ok,
+            "error": self.error if self.error else None,
+            "vram_mb": self.vram_mb if self.vram_mb else None,
+            "peak_vram_mb": self.peak_vram_mb if self.peak_vram_mb else None,
+        }
 
 
 def _http_post(path: str, payload: dict, timeout: int = HTTP_TIMEOUT_BENCHMARK_WARMUP) -> dict:

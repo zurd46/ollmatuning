@@ -26,9 +26,6 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-# Hard rule: NO hardcoded model names. Everything comes from live research
-# against ollama.com's search and library pages.
-
 
 @dataclass
 class Candidate:
@@ -36,13 +33,24 @@ class Candidate:
     family: str
     size_b: float
     est_vram_mb: int
-    categories: list[str]  # always contains "tools"; may also contain "code"
-    source: str = "ollama"   # "ollama" or "huggingface"
-    runtime: str = "ollama"  # "ollama" or "mlx"
+    categories: list[str]
+    source: str = "ollama"
+    runtime: str = "ollama"
 
     @property
     def pretty(self) -> str:
         return f"{self.model} (~{self.size_b:g}B, ~{self.est_vram_mb} MB VRAM)"
+
+    def to_dict(self) -> dict:
+        return {
+            "model": self.model,
+            "family": self.family,
+            "size_b": self.size_b,
+            "est_vram_mb": self.est_vram_mb,
+            "categories": self.categories,
+            "source": self.source,
+            "runtime": self.runtime,
+        }
 
 
 def _head_ok(url: str, timeout: int = HTTP_TIMEOUT_SHORT) -> bool:
@@ -59,7 +67,6 @@ def _head_ok(url: str, timeout: int = HTTP_TIMEOUT_SHORT) -> bool:
 
 
 def verify_model_exists(model: str) -> bool:
-    """Check that <family>:<tag> resolves on ollama.com."""
     if ":" not in model:
         return False
     family, tag = model.split(":", 1)
@@ -76,17 +83,13 @@ def _parse_library_page(page_html: str) -> list[str]:
 
 
 def _fetch_category(cat: str, verbose: bool = False) -> list[str]:
-    """Fetch a category page plus its paginated continuations."""
     families: list[str] = []
-    # ollama.com uses ?c=<cat>&p=<page> — walk pages until empty.
-    for page_num in range(1, 11):  # 10 pages cap is plenty
+    for page_num in range(1, 11):
         url = (
             f"{OLLAMA_LIBRARY_URL}/search?c={cat}"
             if page_num == 1
             else f"{OLLAMA_LIBRARY_URL}/search?c={cat}&p={page_num}"
         )
-        if verbose:
-            logger.debug("fetch %s", url)
         page = fetch_text(url)
         if not page:
             break
@@ -99,7 +102,6 @@ def _fetch_category(cat: str, verbose: bool = False) -> list[str]:
 
 
 def _fetch_full_library(verbose: bool = False) -> list[str]:
-    """Scrape the main /library listing for additional families."""
     families: list[str] = []
     for page_num in range(1, 11):
         url = (
@@ -107,8 +109,6 @@ def _fetch_full_library(verbose: bool = False) -> list[str]:
             if page_num == 1
             else f"{OLLAMA_LIBRARY_URL}/library?p={page_num}"
         )
-        if verbose:
-            logger.debug("fetch %s", url)
         page = fetch_text(url)
         if not page:
             break
@@ -121,12 +121,11 @@ def _fetch_full_library(verbose: bool = False) -> list[str]:
 
 
 _CAPABILITY_RE = re.compile(
-    r">(tools|embedding|vision|thinking)(?:<|[\"'])", re.IGNORECASE
+    r">(\w+)(?:<|\"|')", re.IGNORECASE
 )
 
 
 def model_capabilities(family: str) -> set[str]:
-    """Return the capability badges shown on https://ollama.com/library/<family>."""
     page = fetch_text(f"{OLLAMA_LIBRARY_URL}/library/{family}")
     if not page:
         return set()
@@ -134,37 +133,15 @@ def model_capabilities(family: str) -> set[str]:
 
 
 def model_has_tools(family: str) -> bool:
-    """True iff ollama.com's capability badges for this family include 'tools'."""
     return "tools" in model_capabilities(family)
 
 
-def discover_models(
-    verbose: bool = False,
-    progress_cb=None,
-) -> tuple[list[str], set[str]]:
-    """Return (tool_families, code_family_set) — 100 % live from ollama.com.
-
-    Zero hardcoded model names. Strategy:
-      1. Fetch the full `/library` — ~200+ families, the authoritative list.
-      2. For every family, fetch its detail page in parallel and read the
-         capability badges. Keep only those that advertise 'tools'.
-      3. Also fetch `/search?c=code` to mark which tool-capable models are
-         also code-capable (used for ranking, not gating).
-
-    Hard rule: NOTHING without a verified 'tools' badge is returned.
-    """
+def discover_models(verbose: bool = False, progress_cb=None) -> tuple[list[str], set[str]]:
     library = _fetch_full_library(verbose=verbose)
-    if verbose:
-        logger.debug("full library: %d families", len(library))
     if not library:
         return [], set()
-
     code = _fetch_category("code", verbose=verbose)
     code_set = set(code)
-    if verbose:
-        logger.debug("code category: %d families", len(code))
-
-    # Parallel capability probe — the slow step, so we fan out.
     tool_families: list[str] = []
     with ThreadPoolExecutor(max_workers=OLLAMA_VERIFY_WORKERS) as pool:
         futures = {pool.submit(model_capabilities, fam): fam for fam in library}
@@ -172,23 +149,14 @@ def discover_models(
         for fut in as_completed(futures):
             fam = futures[fut]
             done += 1
-            if progress_cb:
-                progress_cb(done, len(futures), fam)
             try:
                 caps = fut.result()
             except Exception:
-                logger.debug("Failed to get capabilities for %s", fam, exc_info=True)
                 caps = set()
             if "tools" in caps:
                 tool_families.append(fam)
-                if verbose:
-                    logger.debug("tools ok: %s  %s", fam, sorted(caps))
-
-    # Preserve library order (popularity-ranked by ollama.com).
     order_index = {fam: i for i, fam in enumerate(library)}
     tool_families.sort(key=lambda f: order_index.get(f, 1 << 30))
-
-    # Rank: code AND tools first, then tools only.
     intersection = [f for f in tool_families if f in code_set]
     rest = [f for f in tool_families if f not in code_set]
     ordered = intersection + rest
@@ -218,8 +186,6 @@ def _tag_to_size_b(tag: str) -> float:
 
 def _fetch_authoritative_tags(family: str, verbose: bool = False) -> list[tuple[str, float]]:
     url = f"{OLLAMA_LIBRARY_URL}/library/{family}/tags"
-    if verbose:
-        logger.debug("fetch %s", url)
     page = fetch_text(url)
     if not page:
         return []
@@ -236,23 +202,13 @@ def expand_candidates(
     info: SystemInfo,
     code_set: set[str] | None = None,
     verbose: bool = False,
-) -> list[Candidate]:
-    """Expand each tool-capable family into size-filtered Candidate objects.
-
-    Safety: we NEVER invent tags — families with no parseable published tags are
-    dropped. Families are assumed tool-capable (the caller filters this), so every
-    returned Candidate carries the 'tools' category.
-    """
+) -> list["Candidate"]:
     code_set = code_set or set()
-
     vram = compute_vram_budget(info.usable_vram_mb, info.ram_mb, runtime="ollama")
-
-    candidates: list[Candidate] = []
+    candidates: list["Candidate"] = []
     for fam in families:
         tags = _fetch_authoritative_tags(fam, verbose=verbose)
         if not tags:
-            if verbose:
-                logger.debug("skip %s — no published tags", fam)
             continue
         cats = ["tools"]
         if fam in code_set:
@@ -270,19 +226,12 @@ def expand_candidates(
                     categories=list(cats),
                 )
             )
-    # Sort: code+tools first, then bigger-first within that.
     candidates.sort(key=lambda c: (0 if "code" in c.categories else 1, -c.size_b, c.model))
     return candidates
 
 
-def verify_candidates(
-    candidates: list[Candidate],
-    verbose: bool = False,
-) -> list[Candidate]:
-    """HEAD-check every candidate model:tag in parallel. Tool capability is
-    already enforced upstream in `discover_models`, so this only gates tag existence.
-    """
-    verified: list[Candidate] = []
+def verify_candidates(candidates: list["Candidate"], verbose: bool = False) -> list["Candidate"]:
+    verified: list["Candidate"] = []
     with ThreadPoolExecutor(max_workers=OLLAMA_VERIFY_WORKERS) as pool:
         futures = {pool.submit(verify_model_exists, c.model): c for c in candidates}
         for fut in as_completed(futures):
@@ -293,24 +242,14 @@ def verify_candidates(
                 ok = False
             if ok:
                 verified.append(c)
-                if verbose:
-                    logger.debug("ok %s", c.model)
-            elif verbose:
-                logger.debug("x %s (not on ollama.com)", c.model)
-    # Preserve the original ranking order.
     order = {c.model: i for i, c in enumerate(candidates)}
     verified.sort(key=lambda c: order[c.model])
     return verified
 
 
-def shortlist(candidates: list[Candidate], limit: int | None = None) -> list[Candidate]:
-    """Pick one distinct family per entry. If `limit` is None, return all families.
-
-    This keeps the benchmark set diverse (max one size per family) while still
-    covering every eligible family when the caller wants the full sweep.
-    """
+def shortlist(candidates: list["Candidate"], limit: int | None = None) -> list["Candidate"]:
     seen_families: set[str] = set()
-    picked: list[Candidate] = []
+    picked: list["Candidate"] = []
     for c in candidates:
         if c.family in seen_families:
             continue

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python -c \"from ollmatuning.huggingface import search_gguf_models; models = search_gguf_models\\('coder GGUF', limit=5\\); print\\(f'Found {len\\(models\\)} models'\\); [print\\(f'  {m.repo_id} \\({m.downloads} downloads\\)'\\) for m in models[:5]]\")",
+      "Bash(.venv/bin/ollmatuning recommend:*)",
+      "Bash(.venv/bin/ollmatuning --help)",
+      "Bash(.venv/bin/ollmatuning auto:*)",
+      "Bash(.venv/bin/ollmatuning detect:*)",
+      "Bash(.venv/bin/python -c ':*)",
+      "Bash(.venv/bin/ollmatuning)",
+      "Read(//usr/local/**)",
+      "Bash(ollama --version)",
+      "WebFetch(domain:docs.ollama.com)"
+    ]
+  }
+}

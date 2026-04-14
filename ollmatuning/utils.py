@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -45,17 +46,57 @@ HTTP_TIMEOUT_BENCHMARK = 1200
 HF_FETCH_WORKERS = 12
 OLLAMA_VERIFY_WORKERS = 16
 
+# Rate limiting: minimum seconds between HTTP requests to same host
+HTTP_RATE_LIMIT_SECONDS = 0.2
+
 # Bench defaults
-BENCH_MAX_TOKENS = 256
+BENCH_MAX_TOKENS = 512
 
 # Category detection keywords
 CODE_KEYWORDS = ("code", "coder", "coding")
 TOOL_KEYWORDS = ("tool", "function", "func-call")
+REASONING_KEYWORDS = ("reason", "think", "cot", "chain-of-thought")
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+class _RateLimiter:
+    """Simple per-host rate limiter to avoid getting blocked by HF/ollama.com."""
+
+    def __init__(self, min_interval: float = HTTP_RATE_LIMIT_SECONDS):
+        self._min_interval = min_interval
+        self._last_request: dict[str, float] = {}
+
+    def wait(self, url: str) -> None:
+        domain = _url_domain(url)
+        last = self._last_request.get(domain, 0)
+        elapsed = time.monotonic() - last
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+        self._last_request[domain] = time.monotonic()
+
+
+_rate_limiter = _RateLimiter()
+
+
+def _url_domain(url: str) -> str:
+    """Extract the domain from a URL."""
+    # Simple parsing: after :// up to the next /
+    start = url.find("://")
+    if start < 0:
+        return url
+    rest = url[start + 3:]
+    slash = rest.find("/")
+    if slash < 0:
+        return rest
+    return rest[:slash]
 
 
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
+
 
 def setup_logging(verbose: bool = False) -> None:
     """Configure the root logger for the application."""
@@ -67,20 +108,23 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# HTTP helpers with rate limiting
 # ---------------------------------------------------------------------------
+
 
 def fetch_json(url: str, timeout: int = HTTP_TIMEOUT_LONG) -> dict | list | None:
     """Fetch a URL and parse the response as JSON.
 
     Returns None on any network or parsing error.
+    Applies rate limiting to avoid getting blocked.
     """
+    _rate_limiter.wait(url)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        logger.debug("fetch_json(%s) failed: %s", url, exc)
+        logger.warning("fetch_json(%s) failed: %s", url, exc)
         return None
 
 
@@ -88,13 +132,15 @@ def fetch_text(url: str, timeout: int = HTTP_TIMEOUT_MEDIUM) -> str:
     """Fetch a URL and return the response body as text.
 
     Returns empty string on any error.
+    Applies rate limiting to avoid getting blocked.
     """
+    _rate_limiter.wait(url)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logger.debug("fetch_text(%s) failed: %s", url, exc)
+        logger.warning("fetch_text(%s) failed: %s", url, exc)
         return ""
 
 
@@ -102,18 +148,35 @@ def fetch_text(url: str, timeout: int = HTTP_TIMEOUT_MEDIUM) -> str:
 # Model name heuristics
 # ---------------------------------------------------------------------------
 
-_PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[Bb](?:illion)?", re.IGNORECASE)
-_PARAM_NAME_RE = re.compile(r"[-_.](\d+(?:\.\d+)?)[Bb][-_.]")
+# MoE pattern: e.g. "30B-A3B" means 30B total params, 3B active.
+# We want the total count for VRAM estimation.
+_TOTAL_PARAM_RE = re.compile(r"[-_.](\d+(?:\.\d+)?)B[-_.]")
+_MOE_PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)(?:B|billion)[-_]?A[0-9.]+b")
+_GENERIC_PARAM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:B|billion)", re.IGNORECASE)
 
 
 def guess_param_size(repo_id: str) -> float:
-    """Try to extract parameter count (in billions) from repo/model name."""
-    m = _PARAM_NAME_RE.search(repo_id)
+    """Try to extract parameter count (in billions) from repo/model name.
+
+    Handles MoE models like 'Qwen3-235B-A22B' — returns total params (235),
+    not active params. Prefers the -<N>B- pattern which is most common.
+    Falls back to generic <N>B or <N>billion pattern.
+    """
+    # First try the explicit -NB- pattern (includes MoE total: 30B-A3B -> 30)
+    m = _TOTAL_PARAM_RE.search(repo_id)
     if m:
         return float(m.group(1))
-    m = _PARAM_RE.search(repo_id.replace("-", " "))
+
+    # Try MoE-style: 30B-A3B, 235B-A22B etc.
+    m = _MOE_PARAM_RE.search(repo_id)
     if m:
         return float(m.group(1))
+
+    # Generic pattern
+    m = _GENERIC_PARAM_RE.search(repo_id.replace("-", " "))
+    if m:
+        return float(m.group(1))
+
     return 0.0
 
 
@@ -128,6 +191,8 @@ def detect_categories(text: str) -> list[str]:
         cats.append("code")
     if any(k in lower for k in TOOL_KEYWORDS):
         cats.append("tools")
+    if any(k in lower for k in REASONING_KEYWORDS):
+        cats.append("reasoning")
     if not cats:
         cats.append("general")
     return cats
@@ -136,6 +201,7 @@ def detect_categories(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # VRAM / memory budget helpers
 # ---------------------------------------------------------------------------
+
 
 def compute_vram_budget(
     vram_mb: int,

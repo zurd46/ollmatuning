@@ -8,11 +8,14 @@ from ollmatuning.utils import (
     estimate_vram_ollama,
     CODE_KEYWORDS,
     TOOL_KEYWORDS,
+    REASONING_KEYWORDS,
     VRAM_OVERHEAD_GGUF_MB,
     VRAM_OVERHEAD_MLX_MB,
     VRAM_OVERHEAD_OLLAMA_MB,
     DEFAULT_VRAM_FALLBACK_MB,
     DEFAULT_MLX_BUDGET_MB,
+    BENCH_MAX_TOKENS,
+    _RateLimiter,
 )
 
 
@@ -29,10 +32,14 @@ class TestGuessParamSize:
     def test_no_param_match(self):
         assert guess_param_size("some-random-model") == 0.0
 
-    def test_multiple_matches_looser_pattern(self):
-        # "7B" at string start doesn't match _PARAM_NAME_RE (needs delimiter before),
-        # so the looser pattern picks up "13B"
-        assert guess_param_size("7B-13B-model") == 13.0
+    def test_moe_total_params(self):
+        # MoE model: should return total params (30B), not active (3B)
+        result = guess_param_size("Qwen3-30B-A3B-Instruct")
+        assert result == 30.0
+
+    def test_large_moe(self):
+        result = guess_param_size("deepseek-v3-235B-A22B")
+        assert result == 235.0
 
 
 class TestDetectCategories:
@@ -45,6 +52,11 @@ class TestDetectCategories:
         for kw in TOOL_KEYWORDS:
             result = detect_categories(f"model-{kw}-v2")
             assert "tools" in result
+
+    def test_reasoning_keyword(self):
+        for kw in REASONING_KEYWORDS:
+            result = detect_categories(f"model-{kw}-v2")
+            assert "reasoning" in result
 
     def test_code_and_tools(self):
         result = detect_categories("coder-tool-v2")
@@ -59,20 +71,23 @@ class TestDetectCategories:
         result = detect_categories("MODEL-CODE-V2")
         assert "code" in result
 
+    def test_three_categories(self):
+        result = detect_categories("qwen3-coder-tool-thinking")
+        assert "code" in result
+        assert "tools" in result
+        assert "reasoning" in result
+
 
 class TestComputeVramBudget:
     def test_dedicated_vram_above_threshold(self):
-        # If VRAM >= 2048 MB, use it directly
         budget = compute_vram_budget(8192, 16384, runtime="ollama")
         assert budget == 8192
 
     def test_small_vram_uses_ram_fraction_gguf(self):
-        # If VRAM < 2048 MB, use 60% of RAM for GGUF
         budget = compute_vram_budget(1024, 16384, runtime="ollama")
         assert budget == int(16384 * 0.6)
 
     def test_small_vram_uses_ram_fraction_mlx(self):
-        # If VRAM < 2048 MB, use 75% of RAM for MLX
         budget = compute_vram_budget(1024, 16384, runtime="mlx")
         assert budget == int(16384 * 0.75)
 
@@ -91,7 +106,6 @@ class TestComputeVramBudget:
 
 class TestVramEstimates:
     def test_gguf_overhead(self):
-        # 1 GB file = 1024 MB + 500 MB overhead
         size = 1 * 1024 * 1024 * 1024  # 1 GiB
         result = estimate_vram_gguf(size)
         assert result == 1024 + VRAM_OVERHEAD_GGUF_MB
@@ -108,3 +122,22 @@ class TestVramEstimates:
     def test_zero_bytes(self):
         assert estimate_vram_gguf(0) == VRAM_OVERHEAD_GGUF_MB
         assert estimate_vram_mlx(0) == VRAM_OVERHEAD_MLX_MB
+
+
+class TestBenchMaxTokens:
+    def test_is_512(self):
+        assert BENCH_MAX_TOKENS == 512
+        assert isinstance(BENCH_MAX_TOKENS, int)
+        assert BENCH_MAX_TOKENS > 0
+
+
+class TestRateLimiter:
+    def test_rate_limiter_exists(self):
+        rl = _RateLimiter(min_interval=0.01)
+        rl.wait("https://huggingface.co/api/models")
+        # No crash = success
+
+    def test_url_domain_extraction(self):
+        from ollmatuning.utils import _url_domain
+        assert _url_domain("https://huggingface.co/api/models") == "huggingface.co"
+        assert _url_domain("http://localhost:11434/api/tags") == "localhost:11434"

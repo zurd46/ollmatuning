@@ -1,8 +1,8 @@
 """ollmatuning — CLI entry point with OS-aware model selection.
 
 Default behavior based on platform:
-  - macOS Apple Silicon → MLX models from HuggingFace (native, fastest)
-  - Everything else     → GGUF models from HuggingFace (via Ollama)
+  - macOS Apple Silicon -> MLX models from HuggingFace (native, fastest)
+  - Everything else     -> GGUF models from HuggingFace (via Ollama)
 
 Override with --gguf (force GGUF) or --mlx (force MLX).
 Legacy Ollama library search available with --ollama.
@@ -43,7 +43,6 @@ def _resolve_runtime(args: argparse.Namespace) -> str:
         return "mlx"
     if getattr(args, "gguf", False):
         return "ollama"
-    # Auto-detect: Apple Silicon → MLX, else GGUF
     if is_apple_silicon():
         return "mlx"
     return "ollama"
@@ -138,14 +137,7 @@ def _run_benchmark_pipeline(
     candidates: list[Candidate],
     allow_download: bool = False,
 ) -> list[BenchResult]:
-    """Benchmark a list of candidates, dispatching MLX vs Ollama per model.
-
-    By default, only benchmarks models already downloaded locally.
-    Pass allow_download=True (--download flag) to fetch missing models.
-
-    KeyboardInterrupt during a single model skips to the next one.
-    For MLX downloads, Ctrl+C during download saves progress — rerun resumes.
-    """
+    """Benchmark a list of candidates, dispatching MLX vs Ollama per model."""
     from .mlx_benchmark import is_model_cached
 
     local = set(list_local_models()) if ollama_is_up() else set()
@@ -157,35 +149,33 @@ def _run_benchmark_pipeline(
         task = progress.add_task("Benchmark pipeline", total=len(candidates))
         for c in candidates:
             model = c.model
-
             try:
                 if c.runtime == "mlx":
                     cached = is_model_cached(model)
                     if cached:
-                        progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] → cached, benchmarking")
+                        progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] -> cached, benchmarking")
                     elif allow_download:
-                        progress.update(task, description=f"[yellow]{model}[/yellow] → downloading (Ctrl+C to skip)")
+                        progress.update(task, description=f"[yellow]{model}[/yellow] -> downloading (Ctrl+C to skip)")
                     else:
-                        progress.update(task, description=f"[dim]{model}[/dim] → not cached, skipping")
+                        progress.update(task, description=f"[dim]{model}[/dim] -> not cached, skipping")
                         download_skipped.append(model)
                         results.append(BenchResult(model, 0, 0, 0, 0, False, "not downloaded (use --download)"))
                         progress.advance(task)
                         continue
                     r = benchmark_mlx_model(model)
                 else:
-                    # GGUF / Ollama path
-                    progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] → check")
+                    progress.update(task, description=f"[bright_cyan]{model}[/bright_cyan] -> check")
                     already_local = model in local or any(
                         x == model or x.startswith(model + ":") for x in local
                     )
                     if not already_local:
-                        progress.update(task, description=f"[yellow]{model}[/yellow] → pull (Ctrl+C to skip)")
+                        progress.update(task, description=f"[yellow]{model}[/yellow] -> pull (Ctrl+C to skip)")
                         if not pull_model(model, verbose=False):
                             ui.error(f"Pull failed: {model}")
                             results.append(BenchResult(model, 0, 0, 0, 0, False, "pull failed"))
                             progress.advance(task)
                             continue
-                    progress.update(task, description=f"[bright_magenta]{model}[/bright_magenta] → benchmark")
+                    progress.update(task, description=f"[bright_magenta]{model}[/bright_magenta] -> benchmark")
                     r = benchmark_model(model)
 
                 if r.ok:
@@ -204,11 +194,10 @@ def _run_benchmark_pipeline(
 
     if skipped_count:
         ui.info(f"{skipped_count} model(s) skipped. Run again to resume downloads.")
-
     if download_skipped:
         ui.warn(f"{len(download_skipped)} model(s) not downloaded — skipped:")
         for m in download_skipped:
-            ui.info(f"  • {m}")
+            ui.info(f"  - {m}")
         ui.info("Re-run with [bold bright_cyan]--download[/bold bright_cyan] to fetch and benchmark them.")
 
     return results
@@ -220,7 +209,7 @@ def _run_benchmark_pipeline(
 
 def cmd_detect(args: argparse.Namespace) -> int:
     info = detect_system()
-    if args.json:
+    if getattr(args, "json", False):
         print(json.dumps(info.to_dict(), indent=2))
         return 0
     ui.show_banner()
@@ -257,26 +246,38 @@ def cmd_recommend(args: argparse.Namespace) -> int:
 
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
-    ui.show_banner()
-    info = detect_system()
-    ui.show_system(info)
+    use_json = getattr(args, "json", False)
+    if not use_json:
+        ui.show_banner()
+        info = detect_system()
+        ui.show_system(info)
+    else:
+        info = detect_system()
 
     runtime = _resolve_runtime(args)
-    ui.info(f"Runtime: [bold bright_cyan]{runtime.upper()}[/bold bright_cyan]")
+    if not use_json:
+        ui.info(f"Runtime: [bold bright_cyan]{runtime.upper()}[/bold bright_cyan]")
 
     # Pre-flight checks
     if runtime == "mlx" and not mlx_lm_available():
-        ui.error("mlx-lm is not installed.")
-        ui.info("Install it with:  [bold bright_cyan]pip install 'ollmatuning[mlx]'[/bold bright_cyan]")
+        if use_json:
+            print(json.dumps({"error": "mlx-lm not installed", "runtime": "mlx"}))
+        else:
+            ui.error("mlx-lm is not installed.")
+            ui.info("Install it with:  [bold bright_cyan]pip install 'ollmatuning[mlx]'[/bold bright_cyan]")
         return 2
 
     if runtime == "ollama" and not ollama_is_up():
-        ui.error("Ollama server is not running on 127.0.0.1:11434.")
-        ui.info("Start it with:  [bold bright_cyan]ollama serve[/bold bright_cyan]")
+        if use_json:
+            print(json.dumps({"error": "Ollama server not running", "runtime": "ollama"}))
+        else:
+            ui.error("Ollama server is not running on 127.0.0.1:11434.")
+            ui.info("Start it with:  [bold bright_cyan]ollama serve[/bold bright_cyan]")
         return 2
 
     if args.models:
-        ui.info(f"Benchmarking explicit models: [bold]{', '.join(args.models)}[/bold]")
+        if not use_json:
+            ui.info(f"Benchmarking explicit models: [bold]{', '.join(args.models)}[/bold]")
         candidates = [
             Candidate(
                 model=m, family=m.split("/")[-1], size_b=0,
@@ -291,17 +292,22 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
             include_ollama=getattr(args, "ollama", False),
         )
         if not cands:
-            ui.error("No models found.")
+            if use_json:
+                print(json.dumps({"error": "No models found", "runtime": runtime}))
+            else:
+                ui.error("No models found.")
             return 1
 
         if args.limit is not None:
             cands = cands[:args.limit]
 
-        ui.show_candidates(cands, title=f"{len(cands)} candidates to benchmark")
+        if not use_json:
+            ui.show_candidates(cands, title=f"{len(cands)} candidates to benchmark")
         candidates = cands
 
     results = _run_benchmark_pipeline(candidates, allow_download=getattr(args, "download", False))
-    ui.show_results(results)
+    if not use_json:
+        ui.show_results(results)
 
     ok_results = sorted(
         [r for r in results if r.ok],
@@ -309,11 +315,15 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         reverse=True,
     )
     if not ok_results:
-        ui.error("No model benchmarked successfully.")
+        if use_json:
+            print(json.dumps({"error": "No model benchmarked successfully", "results": [r.to_dict() for r in results]}))
+        else:
+            ui.error("No model benchmarked successfully.")
         return 1
 
     best = ok_results[0]
-    ui.show_winner(best)
+    if not use_json:
+        ui.show_winner(best)
 
     if args.set_best:
         _save_config({
@@ -323,22 +333,34 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
             "vram_mb": best.vram_mb,
             "peak_vram_mb": best.peak_vram_mb,
         })
-        ui.success(f"Saved to [bold]{CONFIG_PATH}[/bold]")
-        _print_env_hint(best.model, runtime)
+        if not use_json:
+            ui.success(f"Saved to [bold]{CONFIG_PATH}[/bold]")
+            _print_env_hint(best.model, runtime)
+
+    if use_json:
+        output = {
+            "runtime": runtime,
+            "best": best.to_dict(),
+            "results": [r.to_dict() for r in results],
+        }
+        print(json.dumps(output, indent=2))
 
     return 0
 
 
 def cmd_auto(args: argparse.Namespace) -> int:
-    """All-in-one: detect → search → benchmark → set winner."""
-    ui.show_banner()
+    """All-in-one: detect -> search -> benchmark -> set winner."""
+    use_json = getattr(args, "json", False)
+    if not use_json:
+        ui.show_banner()
 
     ui.step("Step 1/4: detecting hardware and drivers")
     info = detect_system()
     ui.show_system(info)
 
     runtime = _resolve_runtime(args)
-    ui.info(f"Auto-detected runtime: [bold bright_cyan]{runtime.upper()}[/bold bright_cyan]")
+    if not use_json:
+        ui.info(f"Auto-detected runtime: [bold bright_cyan]{runtime.upper()}[/bold bright_cyan]")
 
     # Pre-flight checks
     if runtime == "mlx":
@@ -389,8 +411,17 @@ def cmd_auto(args: argparse.Namespace) -> int:
             "vram_mb": best.vram_mb,
             "peak_vram_mb": best.peak_vram_mb,
         })
-        ui.success(f"Saved to [bold]{CONFIG_PATH}[/bold]")
-        _print_env_hint(best.model, runtime)
+        if not use_json:
+            ui.success(f"Saved to [bold]{CONFIG_PATH}[/bold]")
+            _print_env_hint(best.model, runtime)
+
+    if use_json:
+        output = {
+            "runtime": runtime,
+            "best": {"model": best.model, "tokens_per_sec": best.tokens_per_sec, "vram_mb": best.vram_mb},
+            "results": [{"model": r.model, "tokens_per_sec": r.tokens_per_sec, "ok": r.ok, "error": r.error or ""} for r in results],
+        }
+        print(json.dumps(output, indent=2))
 
     return 0
 
@@ -454,7 +485,6 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Parse args first to get verbose flag for logging setup.
     p = argparse.ArgumentParser(
         prog="ollmatuning",
         description=(
@@ -470,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--download", action="store_true",
                     help="Download missing models (default: only benchmark cached)")
     sp.add_argument("--no-save", action="store_true", help="Do not save the winner")
+    sp.add_argument("--json", action="store_true", help="Output results as JSON")
     sp.set_defaults(func=cmd_auto)
 
     sp = sub.add_parser("detect", help="Show hardware, drivers, and recommended runtime")
@@ -488,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--download", action="store_true",
                     help="Download missing models (default: only benchmark cached)")
     sp.add_argument("--set-best", action="store_true", help="Save winner to ~/.ollmatuning/config.json")
+    sp.add_argument("--json", action="store_true", help="Output results as JSON")
     sp.set_defaults(func=cmd_benchmark)
 
     sp = sub.add_parser("show", help="Show saved configuration")

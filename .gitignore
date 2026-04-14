@@ -3,17 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# Distribution / packaging
-build/
-dist/
 *.egg-info/
 *.egg
+.pyre/
+.pytest_cache/
+dist/
+build/
+*.whl
 
-# Virtual environments
+# Virtualenv
 .venv/
 venv/
-ENV/
+env/
 
 # IDE
 .idea/
@@ -21,9 +22,11 @@ ENV/
 *.swp
 *.swo
 
-# OS
+# macOS
 .DS_Store
-Thumbs.db
 
-# Project
-/.claude
+# ollmatuning
+.ollmatuning/
+
+# HuggingFace cache
+.cache/

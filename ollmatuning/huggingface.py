@@ -7,7 +7,7 @@ Ollama >= 0.4 can pull HF GGUF models directly via:
 This module uses the HuggingFace API to discover popular GGUF models,
 extract available quantizations from file listings, estimate VRAM from
 file sizes, and produce Candidate objects that slot into the existing
-recommend → benchmark pipeline.
+recommend -> benchmark pipeline.
 """
 from __future__ import annotations
 
@@ -65,68 +65,55 @@ class GGUFFile:
 
     @property
     def est_vram_mb(self) -> int:
-        """GGUF file size ≈ model weight size. VRAM ≈ file + overhead."""
         return estimate_vram_gguf(self.size_bytes)
 
 
 @dataclass
 class HFModel:
-    repo_id: str          # e.g. "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF"
+    repo_id: str
     downloads: int
     likes: int
     tags: list[str]
-    gguf_files: list[GGUFFile]
+    gguf_files: list[GGUFFile] = None
+
+    def __post_init__(self):
+        if self.gguf_files is None:
+            self.gguf_files = []
 
     @property
     def ollama_base(self) -> str:
         return f"hf.co/{self.repo_id}"
 
-    def best_quant_for_vram(self, vram_mb: int) -> GGUFFile | None:
+    def best_quant_for_vram(self, vram_mb: int) -> "GGUFFile | None":
         """Pick the best quantization that fits in VRAM budget."""
         fitting = [f for f in self.gguf_files if f.est_vram_mb <= vram_mb]
         if not fitting:
             return None
-        # Prefer Q4_K_M > Q5_K_M > Q6_K > Q8_0 > others
         pref_map = {q.upper(): i for i, q in enumerate(QUANT_PREFERENCE)}
-
         def rank(f: GGUFFile) -> tuple[int, int]:
             idx = pref_map.get(f.quant.upper(), 999)
             return (idx, -f.size_bytes)
-
         fitting.sort(key=rank)
         return fitting[0]
 
 
-def search_gguf_models(
-    query: str = "",
-    limit: int = 40,
-    verbose: bool = False,
-) -> list[HFModel]:
-    """Search HuggingFace for GGUF models.
-
-    Default search (no query) returns the most downloaded GGUF repos.
-    Useful queries: "coder", "instruct", "tool", "function-calling".
-    """
-    params = (
-        f"filter=gguf&sort=downloads&direction=-1&limit={limit}"
-    )
+def search_gguf_models(query: str = "", limit: int = 40, verbose: bool = False) -> list[HFModel]:
+    """Search HuggingFace for GGUF models."""
+    params = f"filter=gguf&sort=downloads&direction=-1&limit={limit}"
     if query:
         params += f"&search={urllib.request.quote(query)}"
     url = f"{HF_API_BASE}/models?{params}"
     if verbose:
         logger.debug("HF search: %s", url)
-
     data = fetch_json(url)
     if not data or not isinstance(data, list):
         return []
-
     models: list[HFModel] = []
     for item in data:
         repo_id = item.get("id", "")
         if not repo_id:
             continue
         tags = item.get("tags", [])
-        # Skip non-GGUF repos that somehow appeared
         if "gguf" not in [t.lower() for t in tags]:
             continue
         models.append(HFModel(
@@ -134,9 +121,7 @@ def search_gguf_models(
             downloads=item.get("downloads", 0),
             likes=item.get("likes", 0),
             tags=tags,
-            gguf_files=[],
         ))
-
     if verbose:
         logger.debug("HF found %d GGUF repos", len(models))
     return models
@@ -147,11 +132,9 @@ def fetch_gguf_files(model: HFModel, verbose: bool = False) -> None:
     url = f"{HF_API_BASE}/models/{model.repo_id}?blobs=true"
     if verbose:
         logger.debug("HF files: %s", url)
-
     data = fetch_json(url, timeout=HTTP_TIMEOUT_MEDIUM)
     if not data or not isinstance(data, dict):
         return
-
     siblings = data.get("siblings", [])
     for sib in siblings:
         fname = sib.get("rfilename", "")
@@ -162,11 +145,7 @@ def fetch_gguf_files(model: HFModel, verbose: bool = False) -> None:
             continue
         m = _QUANT_RE.search(fname)
         quant = m.group(1).upper().replace(".", "_") if m else "unknown"
-        model.gguf_files.append(GGUFFile(
-            filename=fname,
-            quant=quant,
-            size_bytes=size,
-        ))
+        model.gguf_files.append(GGUFFile(filename=fname, quant=quant, size_bytes=size))
 
 
 def discover_hf_models(
@@ -178,8 +157,6 @@ def discover_hf_models(
     """Search HF for GGUF models across multiple queries, deduplicate, fetch file info."""
     if queries is None:
         queries = ["coder GGUF", "instruct GGUF", "tool calling GGUF", "GGUF"]
-
-    # Gather unique repos across queries.
     seen: set[str] = set()
     all_models: list[HFModel] = []
     for q in queries:
@@ -187,32 +164,18 @@ def discover_hf_models(
             if m.repo_id not in seen:
                 seen.add(m.repo_id)
                 all_models.append(m)
-
-    if verbose:
-        logger.debug("HF total unique repos: %d", len(all_models))
-
-    # Fetch file listings in parallel.
     with ThreadPoolExecutor(max_workers=HF_FETCH_WORKERS) as pool:
         futures = {pool.submit(fetch_gguf_files, m, verbose): m for m in all_models}
-        done = 0
         for fut in as_completed(futures):
-            done += 1
             m = futures[fut]
             if progress_cb:
-                progress_cb(done, len(futures), m.repo_id)
+                progress_cb(0, len(futures), m.repo_id)
             try:
                 fut.result()
             except Exception:
                 logger.debug("Failed to fetch files for %s", m.repo_id, exc_info=True)
-
-    # Keep only repos that have actual GGUF files.
     with_files = [m for m in all_models if m.gguf_files]
-    # Sort by downloads descending.
     with_files.sort(key=lambda m: m.downloads, reverse=True)
-
-    if verbose:
-        logger.debug("HF repos with GGUF files: %d", len(with_files))
-
     return with_files
 
 
@@ -223,22 +186,17 @@ def expand_hf_candidates(
 ) -> list["Candidate"]:
     """Convert HF models into Candidate objects that fit VRAM budget."""
     from .recommend import Candidate
-
     vram = compute_vram_budget(info.usable_vram_mb, info.ram_mb, runtime="ollama")
-
     candidates: list[Candidate] = []
     for m in models:
         best = m.best_quant_for_vram(vram)
         if not best:
             if verbose:
-                logger.debug("HF skip %s — no quant fits %d MB", m.repo_id, vram)
+                logger.debug("HF skip %s - no quant fits %d MB", m.repo_id, vram)
             continue
-
         size_b = guess_param_size(m.repo_id)
-        # Determine categories from tags/name.
         lower_tags = " ".join(m.tags).lower() + " " + m.repo_id.lower()
         cats = detect_categories(lower_tags)
-
         ollama_model = f"hf.co/{m.repo_id}:{best.quant}"
         candidates.append(Candidate(
             model=ollama_model,
@@ -247,8 +205,7 @@ def expand_hf_candidates(
             est_vram_mb=best.est_vram_mb,
             categories=cats,
             source="huggingface",
+            runtime="ollama",
         ))
-
-    # Sort: code first, then larger models first.
     candidates.sort(key=lambda c: (0 if "code" in c.categories else 1, -c.size_b, c.model))
     return candidates
