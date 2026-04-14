@@ -392,7 +392,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
     ui.show_candidates(cands, title=f"Top {len(cands)} {fmt_name} models for your hardware")
 
     ui.step("Step 4/4: benchmarking tok/s")
-    results = _run_benchmark_pipeline(cands, allow_download=getattr(args, "download", False))
+    results = _run_benchmark_pipeline(cands, allow_download=True)
     ui.show_results(results)
 
     ok = sorted([r for r in results if r.ok], key=lambda r: r.tokens_per_sec, reverse=True)
