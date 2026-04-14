@@ -14,6 +14,7 @@ from __future__ import annotations
 import gc
 import logging
 import time
+import warnings
 
 from .benchmark import BenchResult, BENCH_PROMPTS
 from .utils import BENCH_MAX_TOKENS
@@ -140,17 +141,19 @@ def download_mlx_model(repo_id: str, verbose: bool = True) -> str | None:
         return None
 
     try:
-        local_dir = snapshot_download(
-            repo_id,
-            allow_patterns=[
-                "*.safetensors",
-                "*.json",
-                "tokenizer.*",
-                "*.model",        # sentencepiece
-                "*.tiktoken",
-            ],
-            resume_download=True,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+            local_dir = snapshot_download(
+                repo_id,
+                allow_patterns=[
+                    "*.safetensors",
+                    "*.json",
+                    "tokenizer.*",
+                    "*.model",        # sentencepiece
+                    "*.tiktoken",
+                ],
+                resume_download=True,
+            )
         return local_dir
     except KeyboardInterrupt:
         if verbose:
